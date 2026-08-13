@@ -54,6 +54,27 @@ run() {
   fi
 }
 
+# A check that does not exist on this platform — as opposed to one that should
+# have run and could not.
+#
+# The distinction is the whole point of `--release` and it was missing. The
+# original failure was: no node on PATH, so the data-plane tests skipped
+# silently and the gate printed "all checks passed" having run neither suite
+# that covers the credential-holding code. That is a **missing dependency on a
+# platform where the check applies**, and it must be fatal.
+#
+# `plutil` on Linux is not that. The artefact under test is a set of macOS
+# launchd templates; a Linux machine cannot validate them, and pretending
+# otherwise would mean either a permanently red Linux CI or dropping the check
+# on macOS too. The macOS jobs do run it, so the templates are still covered.
+#
+# This is deliberately NOT a way to quiet an inconvenient check. If the thing
+# being tested exists on this platform, `skip` is the right call and it stays
+# fatal under --release.
+not_applicable() {
+  printf '\n=== %s\n    N/A: %s\n' "$1" "$2"
+}
+
 # A check that could not run. Reported either way; fatal only for a release.
 skip() {
   if [ "$STRICT" -eq 1 ]; then
@@ -166,7 +187,8 @@ if [ "$(uname -s)" = "Darwin" ]; then
     [ "$found" = 1 ]
   ' _ "$PREFIX"
 else
-  skip "launchd plist syntax" "不是 macOS —— plutil 不可用, 模板未校验"
+  not_applicable "launchd plist syntax" \
+    "不是 macOS —— launchd 模板由 macOS 那一格校验"
 fi
 
 # --- schema migration round trip --------------------------------------------
