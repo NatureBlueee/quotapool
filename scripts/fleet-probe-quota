@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""Measure accounts whose quota the scheduler has never read.
+
+There is a bootstrap deadlock in the router. `control.py` builds the min-cost
+flow only from accounts whose remaining quota is known:
+
+    if five_remaining is None or weekly_remaining is None:
+        continue          # control.py:1685
+
+and quota is only learned from the response headers of a request that actually
+used the account. So an account with no reading is excluded from the optimizer,
+is therefore never routed to, and therefore never gets a reading. It escapes
+only when every measured account is blocked, at which point the heuristic
+candidate path picks it up.
+
+That is not academic. Measured on the server: `hello@` sat at unknown while the
+Mac knew it was 33% used, so 67% of a weekly window was invisible to the
+scheduler that was meanwhile parking 556 requests for no_capacity. One pinned
+four-token request moved it from null to 0.33, matching the Mac exactly.
+
+The measurement is far cheaper than the thing it prevents, so this runs it:
+one minimal request per unmeasured account, pinned, then the pin is removed.
+
+    fleet-probe-quota              probe every unmeasured account
+    fleet-probe-quota --dry-run    list what it would probe, spend nothing
+    fleet-probe-quota --max 1      bound the number of probes
+
+Exit codes: 0 nothing to do or every probe produced a reading, 1 at least one
+probe ran and produced no reading, 2 the fleet could not be reached.
+
+DELIBERATE LIMITATION: a `shared` account with unknown quota is reported but not
+probed. `coordinator.pin_check` refuses to pin a shared account whose quota is
+unknown, because the whole point of the reserve floor is that we never spend a
+shared subscription blind. Reporting it and declining to spend is the correct
+side to fail on; do not weaken the guard to make this script tidier.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# The state database is WAL, and a `mode=ro` connection cannot create the
+# -shm or run WAL recovery — it fails intermittently with "unable to open
+# database file". Measured at 8% of fleet-quota-sync runs and six times in
+# fleet-health, which means this check had blind spots it never reported.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from claude_fleet.db import connect_readonly  # noqa: E402
+from typing import Any, Dict, List, Optional
+
+# Dedicated so a probe can never collide with a real workload's policy, and so
+# a pin left behind by a crash is obvious for what it is.
+PROBE_WORKLOAD = "fleet:quota-probe"
+PROBE_PROMPT = "只回复两个字：可用"
+PROBE_MODEL = "claude-sonnet-5"
+PROBE_TIMEOUT = 180
+
+
+def _runtime() -> Dict[str, Any]:
+    path = Path(os.environ.get(
+        "FLEET_RUNTIME_CONFIG",
+        str(Path.home() / ".config" / "claude-fleet" / "runtime.json"),
+    )).expanduser()
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _fleet_bin() -> Optional[str]:
+    return (
+        os.environ.get("FLEET_BIN")
+        or shutil.which("fleet")
+        or (str(Path.home() / ".local" / "bin" / "fleet")
+            if (Path.home() / ".local" / "bin" / "fleet").exists() else None)
+    )
+
+
+def _accounts(db_path: str) -> List[Dict[str, Any]]:
+    conn = connect_readonly(db_path, timeout=5)
+    conn.row_factory = sqlite3.Row
+    try:
+        return [dict(row) for row in conn.execute(
+            "SELECT id, kind, state, weekly_used, five_hour_used, "
+            "       weekly_floor, updated_at "
+            "FROM accounts ORDER BY id"
+        )]
+    finally:
+        conn.close()
+
+
+def _disabled_ids(port: int) -> set:
+    """Accounts the data plane has taken out of service.
+
+    No proxy: this is loopback, and inheriting HTTPS_PROXY would send the probe
+    of the fleet through the fleet.
+    """
+    try:
+        import urllib.request
+
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(f"http://127.0.0.1:{port}/teamclaude/status", timeout=4) as r:
+            live = json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return set()
+    out = set()
+    for account in live.get("accounts", []):
+        if account.get("disabled") or account.get("status") == "disabled":
+            # Same identity rule as fleet-coordinator.js:9.
+            out.add(account.get("accountUuid") or account.get("name"))
+    return out
+
+
+def _unmeasured(
+    accounts: List[Dict[str, Any]],
+    disabled_ids: set,
+) -> List[Dict[str, Any]]:
+    """Accounts the optimizer cannot see.
+
+    EITHER bucket being null is enough. `control._remaining` returns None for a
+    null reading rather than treating it as a full window (control.py:1292-1296),
+    and control.py:1685 drops the account when either bucket comes back None.
+
+    That second case is easy to under-rate: an account can have a perfectly good
+    weekly reading with plenty of headroom and still be invisible to the
+    optimizer because its five-hour bucket has never been read.
+    """
+    targets = []
+    for account in accounts:
+        if account["state"] == "disabled" or account["id"] in disabled_ids:
+            # A retired account with a dead refresh token would burn a probe on
+            # a guaranteed 401. The data plane knows it is disabled even when
+            # the control database still calls it healthy.
+            continue
+        weekly = account["weekly_used"]
+        five = account["five_hour_used"]
+        if weekly is not None and five is not None:
+            continue
+        if weekly is not None and weekly >= 1.0 - float(account["weekly_floor"] or 0):
+            # The weekly window is measured and spent. Learning the five-hour
+            # bucket changes nothing until that window resets, so this is not
+            # capacity the scheduler is missing — it is capacity that is gone.
+            continue
+        targets.append(account)
+    return targets
+
+
+def _run(fleet: str, args: List[str], timeout: int = 60) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [fleet, *args], capture_output=True, text=True, timeout=timeout,
+    )
+
+
+def probe(fleet: str, db_path: str, account_id: str) -> Dict[str, Any]:
+    """Pin one minimal request to `account_id`, then always remove the pin.
+
+    The pin is removed in a `finally`: a probe that leaves a hard_pin behind
+    would silently park every future request for this workload id, which is
+    exactly the failure class `reconcile` now reports as DANGLING_WORKLOAD_POLICY.
+    """
+    result: Dict[str, Any] = {"account": account_id}
+    pin = _run(fleet, ["--db", db_path, "policy", "set", PROBE_WORKLOAD,
+                       "--pin", account_id])
+    if pin.returncode != 0:
+        # The commonest cause is the shared-account guard, which is a refusal
+        # by design rather than a failure.
+        result["status"] = "refused"
+        result["detail"] = (pin.stderr or pin.stdout).strip()[:200]
+        return result
+    try:
+        run = _run(fleet, ["--db", db_path, "run",
+                           "--class", "interactive",
+                           "--workload-id", PROBE_WORKLOAD,
+                           "--", "--model", PROBE_MODEL, "-p", PROBE_PROMPT],
+                   timeout=PROBE_TIMEOUT)
+        result["status"] = "ok" if run.returncode == 0 else "failed"
+        if run.returncode != 0:
+            result["detail"] = (run.stderr or run.stdout).strip()[-300:]
+    except subprocess.TimeoutExpired:
+        result["status"] = "timeout"
+    finally:
+        _run(fleet, ["--db", db_path, "policy", "set", PROBE_WORKLOAD])
+    return result
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="measure accounts the scheduler has never read")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--max", type=int, default=8,
+                        help="stop after this many probes")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+
+    runtime = _runtime()
+    db_path = str(runtime.get("db_path") or "")
+    if not db_path or not Path(db_path).exists():
+        print("状态库不可达，无法判断", file=sys.stderr)
+        return 2
+    fleet = _fleet_bin()
+    if not fleet:
+        print("找不到 fleet 可执行文件（设 FLEET_BIN）", file=sys.stderr)
+        return 2
+
+    try:
+        accounts = _accounts(db_path)
+    except sqlite3.Error as exc:
+        print(f"读状态库失败：{exc}", file=sys.stderr)
+        return 2
+
+    targets = _unmeasured(
+        accounts,
+        _disabled_ids(int(runtime.get("proxy_port", 13456))),
+    )
+    report: Dict[str, Any] = {
+        "at": time.time(),
+        "accounts": len(accounts),
+        "unmeasured": [item["id"] for item in targets],
+        "probes": [],
+    }
+
+    if not targets:
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False))
+        else:
+            print(f"全部 {len(accounts)} 个账号都有额度读数，无需探测")
+        return 0
+
+    if args.dry_run:
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False))
+        else:
+            print(f"将探测 {len(targets)} 个未测量账号（--dry-run，未花费）：")
+            for item in targets:
+                print(f"  {item['id']}  kind={item['kind']}")
+        return 0
+
+    for item in targets[:args.max]:
+        report["probes"].append(probe(fleet, db_path, item["id"]))
+
+    after = {row["id"]: row for row in _accounts(db_path)}
+    unresolved = 0
+    for entry in report["probes"]:
+        row = after.get(entry["account"]) or {}
+        entry["weekly_used_after"] = row.get("weekly_used")
+        entry["five_hour_used_after"] = row.get("five_hour_used")
+        # Still unresolved if EITHER bucket is null, since either one alone is
+        # enough to keep the account out of the optimizer.
+        if entry["status"] == "ok" and (
+            entry["weekly_used_after"] is None
+            or entry["five_hour_used_after"] is None
+        ):
+            unresolved += 1
+
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False))
+    else:
+        def _show(value: Optional[float]) -> str:
+            return "仍未知" if value is None else f"{value:.2f}"
+
+        for entry in report["probes"]:
+            print(f"  {entry['account']}  {entry['status']:8s}  "
+                  f"周 {_show(entry['weekly_used_after'])}  "
+                  f"5小时 {_show(entry['five_hour_used_after'])}"
+                  + (f"  {entry.get('detail', '')}" if entry.get("detail") else ""))
+        if len(targets) > args.max:
+            # Never let a bound look like full coverage.
+            print(f"（还有 {len(targets) - args.max} 个未探测，受 --max 限制）")
+
+    return 1 if unresolved else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""What a composite-identity migration would do, without doing any of it.
+
+    fleet-identity-check              this host
+    fleet-identity-check --peer HOST  this host and its peer
+
+## The defect
+
+`fleet-coordinator.js` keys an account as `accountUuid || name`, and the control
+plane stores `org_uuid` in metadata rather than in the key. One Claude account
+that belongs to two organisations therefore collapses into a single row —
+credentials, quota, reserve floor, pins and audit history for two distinct
+subscriptions merged into one. That is data corruption, not a display problem.
+
+## Why this script exists before any migration
+
+Changing a SQLite primary key means rebuilding the table, and
+`route_leases.account_id` is a foreign key into it with `PRAGMA foreign_keys=ON`.
+On this Mac that is 16,866 lease rows across five accounts. `db.py`'s migration
+mechanism only knows how to add columns, so there is no existing machinery for
+this and no downgrade path once it runs.
+
+Against that cost, the measured facts matter: on this fleet every accountUuid
+already maps to exactly one orgUuid. The corruption is latent, not active.
+
+So the sequence is: make a collision impossible to absorb silently (the control
+plane refuses and alarms), and keep the migration available for the day someone
+actually adds a second organisation. This script is what tells you which day
+that is — and what it would cost.
+
+It opens every database read-only and writes nothing.
+"""
+
+from __future__ import annotations
+
+
+def _peer_host() -> str:
+    """The other host, from config rather than a literal.
+
+    It used to be a hardcoded hostname, which is both un-publishable and wrong
+    for anyone else's fleet: they would have to edit source to use their own
+    machine. runtime.json already carries this host's identity; the peer belongs
+    next to it.
+    """
+    if os.environ.get("FLEET_PEER"):
+        return os.environ["FLEET_PEER"]
+    try:
+        import json as _json
+        runtime = _json.loads(
+            (pathlib.Path(os.environ.get(
+                "FLEET_RUNTIME_CONFIG",
+                str(pathlib.Path.home() / ".config" / "claude-fleet" / "runtime.json"))
+            )).read_text(encoding="utf-8"))
+        return str(runtime.get("peer_host") or "")
+    except Exception:                                         # noqa: BLE001
+        return ""
+
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import pathlib
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "src"))
+
+BOLD, DIM, RED, YELLOW, GREEN, RESET = (
+    "\033[1m", "\033[2m", "\033[31m", "\033[33m", "\033[32m", "\033[0m")
+
+SCAN = """
+import json, os, sys
+sys.path.insert(0, %(repo)r + "/src")
+from claude_fleet.db import connect_readonly
+runtime = json.load(open(os.path.expanduser("~/.config/claude-fleet/runtime.json")))
+db = connect_readonly(runtime["db_path"])
+rows = []
+for row in db.execute("SELECT id, kind, state, metadata FROM accounts"):
+    meta = json.loads(row["metadata"] or "{}")
+    rows.append({
+        "id": row["id"],
+        "kind": row["kind"],
+        "state": row["state"],
+        "account_uuid": meta.get("account_uuid"),
+        "org_uuid": meta.get("org_uuid"),
+        "runtime_name": meta.get("runtime_name") or meta.get("name"),
+    })
+leases = {r[0]: r[1] for r in db.execute(
+    "SELECT account_id, count(*) FROM route_leases GROUP BY account_id")}
+print(json.dumps({"accounts": rows, "leases": leases}))
+"""
+
+
+def _scan(host: Optional[str], repo: str) -> Dict[str, Any]:
+    body = SCAN % {"repo": repo}
+    if host:
+        result = subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=8", host, "HOME=/home/nature python3 -"],
+            input=body, capture_output=True, text=True, timeout=60)
+    else:
+        result = subprocess.run([sys.executable, "-c", body],
+                                capture_output=True, text=True, timeout=60)
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout).strip()[-200:])
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def _composite(account: Dict[str, Any]) -> Optional[str]:
+    uuid = account.get("account_uuid")
+    if not uuid:
+        return None
+    org = account.get("org_uuid") or "-"
+    return "%s/%s" % (uuid, org)
+
+
+def _report(label: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    accounts: List[Dict[str, Any]] = data["accounts"]
+    leases: Dict[str, int] = data["leases"]
+
+    print("\n%s%s%s" % (BOLD, label, RESET))
+
+    by_uuid: Dict[str, List[Dict[str, Any]]] = {}
+    unkeyed, would_move = [], []
+    for account in accounts:
+        uuid = account.get("account_uuid")
+        if not uuid:
+            unkeyed.append(account)
+            continue
+        by_uuid.setdefault(uuid, []).append(account)
+        if _composite(account) != account["id"]:
+            would_move.append(account)
+
+    collisions = {u: rows for u, rows in by_uuid.items()
+                  if len({r.get("org_uuid") for r in rows}) > 1}
+
+    print("  账号 %d 个 · 租约引用 %d 条" % (len(accounts), sum(leases.values())))
+
+    if collisions:
+        print("  %s✗ 身份碰撞 %d 处 —— 两个组织合并成了一行%s"
+              % (RED, len(collisions), RESET))
+        for uuid, rows in collisions.items():
+            print("      %s" % uuid)
+            for row in rows:
+                print("        org=%s  state=%s" % (row.get("org_uuid"), row["state"]))
+    else:
+        print("  %s✓ 无身份碰撞%s %s(每个 accountUuid 只对应一个组织)%s"
+              % (GREEN, RESET, DIM, RESET))
+
+    if unkeyed:
+        print("  %s⚠ %d 行没有 accountUuid, 用名字当主键%s"
+              % (YELLOW, len(unkeyed), RESET))
+        for row in unkeyed:
+            n = leases.get(row["id"], 0)
+            print("      %-24s state=%-9s 租约 %d 条%s"
+                  % (row["id"][:24], row["state"], n,
+                     "   ← 僵尸行, 迁移时应丢弃" if n == 0 else ""))
+
+    if would_move:
+        print("  %s迁移会改写 %d 行的主键:%s" % (DIM, len(would_move), RESET))
+        for row in would_move[:8]:
+            print("      %s%s → %s  (%d 条租约要跟着改)%s"
+                  % (DIM, row["id"][:20], (_composite(row) or "?")[:44],
+                     leases.get(row["id"], 0), RESET))
+
+    return {
+        "host": label,
+        "accounts": len(accounts),
+        "leases": sum(leases.values()),
+        "collisions": len(collisions),
+        "unkeyed": len(unkeyed),
+        "would_move": len(would_move),
+    }
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="fleet-identity-check",
+        description="只读: 复合身份迁移会做什么, 以及现在有没有碰撞。")
+    parser.add_argument("--peer", default=_peer_host())
+    parser.add_argument("--no-peer", action="store_true")
+    parser.add_argument("--peer-repo",
+                        default="/home/nature/.local/share/claude-fleet")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+
+    targets = [(None, "本机", str(REPO))]
+    if not args.no_peer:
+        targets.append((args.peer, args.peer, args.peer_repo))
+
+    summaries = []
+    for host, label, repo in targets:
+        try:
+            summaries.append(_report(label, _scan(host, repo)))
+        except Exception as exc:                              # noqa: BLE001
+            print("\n%s%s 扫不到: %s%s" % (RED, label, str(exc)[:140], RESET),
+                  file=sys.stderr)
+            summaries.append({"host": label, "error": str(exc)[:140]})
+
+    if args.json:
+        print(json.dumps(summaries, ensure_ascii=False, indent=2))
+        return 0
+
+    total_collisions = sum(s.get("collisions") or 0 for s in summaries)
+    print()
+    if total_collisions:
+        print("%s结论: 存在 %d 处身份碰撞 —— 迁移是必须的, 而且要先想清楚"
+              "两行怎么拆%s" % (RED, total_collisions, RESET))
+        return 1
+    print("%s结论: 没有碰撞。迁移可以等到真的加进第二个组织那天再做;"
+          "在那之前控制面会拒绝并告警, 不会静默合并。%s" % (GREEN, RESET))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

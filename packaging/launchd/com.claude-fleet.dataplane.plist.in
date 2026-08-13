@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>FLEET_RUNTIME_CONFIG</key>
+		<string>@HOME@/.config/claude-fleet/runtime.json</string>
+	</dict>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>Label</key>
+	<string>com.claude-fleet.dataplane</string>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@HOME@/.local/bin/claude-fleet-dataplane-service</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>@HOME@/.local/state/claude-fleet/dataplane.error.log</string>
+	<key>StandardOutPath</key>
+	<string>@HOME@/.local/state/claude-fleet/dataplane.log</string>
+</dict>
+</plist>

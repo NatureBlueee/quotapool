@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.claude-fleet.quotasync</string>
+  <key>ProgramArguments</key>
+  <array><string>@HOME@/.local/share/claude-fleet/scripts/fleet-quota-sync</string></array>
+  <!-- Ten minutes. A quota window is read roughly per request, so a host that
+       is routing keeps itself current; this is for the host that ISN'T, which
+       is the deadlock case — an account that looks spent gets no traffic, so
+       it never learns otherwise. Ten minutes bounds how long that lasts. -->
+  <key>StartInterval</key><integer>600</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>@HOME@/.local/state/claude-fleet/quotasync.log</string>
+  <key>StandardErrorPath</key><string>@HOME@/.local/state/claude-fleet/quotasync.error.log</string>
+  <!-- Batch work nobody is waiting on, unlike the coordinator and data plane. -->
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+</dict>
+</plist>

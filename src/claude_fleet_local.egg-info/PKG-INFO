@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: claude-fleet-local
+Version: 0.4.8
+Summary: Local Claude Code execution control plane and safe account router
+License: MIT
+Requires-Python: >=3.9

@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""Can a NEW process still authenticate?
+
+    fleet-probe-auth            run the probe, update state, exit non-zero on failure
+    fleet-probe-auth --read     print the last result without running anything
+
+## Why this exists
+
+Credentials expired on 2026-07-17 23:15 and were not noticed until 07-29 —
+eleven days during which the system looked entirely green. Conversations flowed,
+background sessions started, CLI commands ran.
+
+It hid because a long-lived daemon keeps the old token in memory. The split is
+not between transports, it is between OLD and NEW processes:
+
+    claude -p       new process every time   → dies
+    claude --bg     handed to the daemon     → lives
+
+So anything that checks authentication from inside an already-running process
+reports green while every new process is dying. The check has to SPAWN.
+
+The error only surfaces when something new actually tries:
+
+    Failed to authenticate: OAuth session expired and could not be refreshed
+
+In this fleet it showed up as `verify-step` forks dying about a second after
+launch — nine lines of transcript, no assistant turn — and as `work complete`
+stalling at "起独立验证 fork" with exit=1. Neither of those says "auth" anywhere,
+which is why it took eleven days.
+
+## What it does not do
+
+It does not refresh anything. Refresh rotates the refresh token, and two hosts
+refreshing the same account's family knock each other out — this fleet has been
+bitten by that already. The probe only asks whether a fresh process can complete
+one trivial exchange.
+
+## Two paths, because they fail independently
+
+  bare    no Fleet environment at all — uses Claude Code's own credentials
+  fleet   through the launcher — uses the credentials the data plane holds
+
+The 2026-07 incident was the bare path. A data plane whose account tokens have
+gone bad would be the other. Reporting one number would hide whichever half is
+still working.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+STATE = Path.home() / ".local" / "state" / "claude-fleet" / "auth-probe.json"
+FLEET = Path(__file__).resolve().parent.parent / "scripts"
+# Cheapest model that still exercises the whole authenticated path.
+MODEL = os.environ.get("FLEET_PROBE_MODEL", "claude-haiku-4-5-20251001")
+PROMPT = "ok"
+TIMEOUT = 120
+
+# Substrings that mean "the credential chain is broken", as opposed to a
+# transient network problem. Matched case-insensitively.
+AUTH_MARKERS = (
+    "oauth session expired",
+    "could not be refreshed",
+    "failed to authenticate",
+    "invalid api key",
+    "authentication_error",
+    "401",
+)
+
+
+def _looks_like_auth_failure(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in AUTH_MARKERS)
+
+
+def _run(command, env) -> Dict[str, Any]:
+    started = time.time()
+    try:
+        result = subprocess.run(
+            command, env=env, capture_output=True, text=True,
+            timeout=TIMEOUT, stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "reason": "timeout", "seconds": TIMEOUT,
+                "detail": "no answer in %ds" % TIMEOUT}
+    except OSError as exc:
+        return {"ok": False, "reason": "spawn_failed", "detail": str(exc)[:200]}
+    output = f"{result.stdout}\n{result.stderr}".strip()
+    elapsed = round(time.time() - started, 1)
+    if result.returncode == 0 and result.stdout.strip():
+        return {"ok": True, "seconds": elapsed}
+    return {
+        "ok": False,
+        # Distinguished so a flaky network does not read as a dead credential.
+        "reason": "auth" if _looks_like_auth_failure(output) else "failed",
+        "exit": result.returncode,
+        "seconds": elapsed,
+        "detail": output[-400:],
+    }
+
+
+def _find_claude() -> str:
+    """Resolve the binary explicitly rather than trusting PATH.
+
+    The probe builds a minimal environment on purpose, and under systemd or
+    sudo the inherited PATH does not contain ~/.local/bin — so `claude` failed
+    to spawn on the server and the bare path went untested. A probe that cannot
+    run is not a passing probe, but it is also not an auth failure: it is
+    reported as `spawn_failed` so it reads as DEGRADED rather than as a dead
+    credential.
+    """
+    override = os.environ.get("FLEET_PROBE_CLAUDE")
+    if override:
+        return override
+    for candidate in (
+        Path.home() / ".local" / "bin" / "claude",
+        Path("/opt/homebrew/bin/claude"),
+        Path("/usr/local/bin/claude"),
+    ):
+        if candidate.exists():
+            return str(candidate)
+    return "claude"
+
+
+def probe() -> Dict[str, Any]:
+    claude = _find_claude()
+
+    # A deliberately minimal environment. Inheriting the caller's would import
+    # whatever Fleet identity this process happens to carry, and the whole point
+    # is to test what a process starting from nothing gets.
+    bare_env = {
+        "HOME": os.path.expanduser("~"),
+        # The real binary is resolved above; PATH still has to let it find
+        # node and its own helpers.
+        "PATH": os.environ.get("PATH", "") + ":"
+                + str(Path.home() / ".local" / "bin") + ":/usr/bin:/bin",
+        "TERM": "dumb",
+    }
+    bare = _run([claude, "-p", PROMPT, "--model", MODEL], bare_env)
+
+    fleet_env = dict(os.environ)
+    fleet = _run(
+        [os.path.expanduser("~/.local/bin/fleet"), "run",
+         "--class", "fork", "--workload-id", "probe:auth",
+         "--", "--model", MODEL, "-p", PROMPT],
+        fleet_env,
+    )
+
+    return {
+        "at": time.time(),
+        "model": MODEL,
+        "bare": bare,
+        "fleet": fleet,
+        # `fork` on purpose: that is the class that died silently last time, and
+        # a probe that exercises a different class than the thing that breaks is
+        # a probe that will pass while the fleet is down.
+        "ok": bool(bare.get("ok") and fleet.get("ok")),
+    }
+
+
+def _load() -> Optional[Dict[str, Any]]:
+    try:
+        return json.loads(STATE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="can a new process authenticate")
+    parser.add_argument("--read", action="store_true",
+                        help="print the last result without running a probe")
+    parser.add_argument("--quiet", action="store_true")
+    args = parser.parse_args(argv)
+
+    if args.read:
+        state = _load()
+        print(json.dumps(state or {}, ensure_ascii=False))
+        return 0 if (state or {}).get("ok") else 1
+
+    result = probe()
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(STATE)
+
+    if not args.quiet:
+        for name in ("bare", "fleet"):
+            entry = result[name]
+            mark = "✓" if entry.get("ok") else "✗"
+            extra = "" if entry.get("ok") else "  %s: %s" % (
+                entry.get("reason"), str(entry.get("detail"))[:150])
+            print("  %s %-6s %ss%s" % (mark, name, entry.get("seconds", "?"), extra))
+    return 0 if result["ok"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

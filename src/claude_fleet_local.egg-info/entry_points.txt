@@ -1,0 +1,2 @@
+[console_scripts]
+fleet = claude_fleet.cli:main

@@ -1,0 +1,392 @@
+#!/usr/bin/env python3
+"""Acceptance by measurement, not by "the tests passed".
+
+    fleet-accept baseline <name>    capture the current state under a name
+    fleet-accept compare <name>     measure again and judge against it
+    fleet-accept list               what baselines exist
+
+Green tests were not enough and there is a specific reason to distrust them
+here: `fleet-snapshot` was dead for hours — the desktop panel rendering stale
+numbers with no error anywhere — while every test in the suite passed. Tests
+prove the code does what it was written to do. They cannot prove the fleet got
+better, because "better" is a statement about production over time.
+
+So a phase is not done when tests go green. It is done when a baseline taken
+BEFORE the change and a measurement taken after it differ in the direction the
+design predicted, on live traffic, after a soak.
+
+## The part that cannot be recovered later
+
+The "before" number. Once the change ships, the old behaviour is gone and any
+baseline reconstructed afterwards is a guess dressed as evidence. That is the
+whole reason this exists as a command rather than a paragraph in a document:
+running it has to be step zero of every phase, before a line is edited.
+
+Baselines are stored with the git HEAD they were taken at, so a comparison
+against a baseline from a different tree is reported rather than silently
+believed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+# The state database is WAL, and a `mode=ro` connection cannot create the
+# -shm or run WAL recovery — it fails intermittently with "unable to open
+# database file". Measured at 8% of fleet-quota-sync runs and six times in
+# fleet-health, which means this check had blind spots it never reported.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from claude_fleet.db import connect_readonly  # noqa: E402
+from typing import Any, Dict, List, Optional
+
+STORE = Path.home() / ".local" / "state" / "claude-fleet" / "acceptance"
+WINDOW_SECONDS = 24 * 3600
+
+
+def _runtime() -> Dict[str, Any]:
+    path = Path(os.environ.get(
+        "FLEET_RUNTIME_CONFIG",
+        str(Path.home() / ".config" / "claude-fleet" / "runtime.json"),
+    )).expanduser()
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _head() -> str:
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parent.parent,
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _waiting(port: int) -> Dict[str, Any]:
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(
+            f"http://127.0.0.1:{port}/teamclaude/status", timeout=5
+        ) as response:
+            return json.loads(response.read().decode("utf-8")).get("waiting") or {}
+    except Exception:
+        return {}
+
+
+def measure() -> Dict[str, Any]:
+    """Everything a phase's acceptance criteria can refer to.
+
+    Deliberately one function producing one shape: a criterion that needs a
+    number this does not collect is a criterion that cannot be checked, and
+    that is worth discovering while writing the phase rather than while
+    trying to sign it off.
+    """
+    runtime = _runtime()
+    db_path = str(runtime.get("db_path") or "")
+    now = time.time()
+    since = now - WINDOW_SECONDS
+    out: Dict[str, Any] = {
+        "at": now,
+        "head": _head(),
+        "window_hours": WINDOW_SECONDS / 3600,
+        "waiting": _waiting(int(runtime.get("proxy_port", 13456))),
+    }
+    if not db_path or not Path(db_path).exists():
+        out["error"] = "state database unavailable"
+        return out
+
+    conn = connect_readonly(db_path, timeout=5)
+    conn.row_factory = sqlite3.Row
+    try:
+        def count(kind: str) -> int:
+            return conn.execute(
+                "SELECT count(*) FROM events WHERE kind=? AND at>?", (kind, since)
+            ).fetchone()[0]
+
+        out["routes"] = count("route.changed")
+        out["parks"] = count("execution.parked")
+
+        # A decision slow enough that the data plane is at risk of giving up on
+        # it and holding the request. The coordinator writes one row per slow
+        # decision and nothing otherwise, so this is a count of a defect, not a
+        # rate to normalise.
+        out["slow_decisions"] = count("route.slow")
+        worst = 0.0
+        for row in conn.execute(
+            "SELECT payload FROM events WHERE kind='route.slow' AND at>?",
+            (since,),
+        ).fetchall():
+            try:
+                worst = max(worst, float(json.loads(row[0])["seconds"]))
+            except (ValueError, KeyError, TypeError):
+                continue
+        out["worst_decision_seconds"] = round(worst, 2) if worst else 0.0
+
+        # Why routes changed. `switch_ahead` should appear only after Phase 1,
+        # and its absence beforehand is itself part of the baseline.
+        reasons: Dict[str, int] = {}
+        for row in conn.execute(
+            "SELECT payload FROM events WHERE kind='route.changed' AND at>?", (since,)
+        ):
+            try:
+                reasons[str(json.loads(row["payload"]).get("reason"))] = reasons.get(
+                    str(json.loads(row["payload"]).get("reason")), 0) + 1
+            except (TypeError, ValueError):
+                continue
+        out["route_reasons"] = reasons
+
+        # The number Phase 1 is meant to move: how close accounts are allowed to
+        # get to their ceiling. A margin that works shows up here as a peak that
+        # stops touching 1.0.
+        peaks: Dict[str, float] = {}
+        for row in conn.execute(
+            "SELECT subject, payload FROM events "
+            "WHERE kind='account.runtime_synced' AND at>?", (since,)
+        ):
+            try:
+                weekly = json.loads(row["payload"]).get("weekly_used")
+            except (TypeError, ValueError):
+                continue
+            if weekly is None:
+                continue
+            key = str(row["subject"])
+            peaks[key] = max(peaks.get(key, 0.0), float(weekly))
+        out["weekly_peaks"] = peaks
+
+        # Moments where switch-ahead COULD have fired: an account inside the
+        # margin with a live route lease on it. Without this the criterion above
+        # cannot tell "did not fire" from "was never asked to".
+        opportunities = 0
+        for row in conn.execute(
+            "SELECT subject, payload FROM events "
+            "WHERE kind='account.runtime_synced' AND at>?", (since,)
+        ):
+            try:
+                weekly = json.loads(row["payload"]).get("weekly_used")
+            except (TypeError, ValueError):
+                continue
+            if weekly is None or not 0.98 <= float(weekly) < 1.0:
+                continue
+            live = conn.execute(
+                "SELECT 1 FROM route_leases WHERE account_id=? AND updated_at>? LIMIT 1",
+                (row["subject"], since),
+            ).fetchone()
+            if live:
+                opportunities += 1
+        out["switch_ahead_opportunities"] = opportunities
+        out["accounts_at_ceiling"] = sum(1 for v in peaks.values() if v >= 0.999)
+
+        # Switches per session. Phase 1 promises at most one switch-ahead per
+        # session per window; a rise here is the flapping this is meant to avoid.
+        #
+        # Keyed on `subject`, which IS the session id for route.changed. The
+        # first version read `payload.session_id` — a field this event does not
+        # carry — and fell back to the first 24 bytes of the JSON, which is a
+        # prefix of the payload and collapses unrelated sessions into one key.
+        # It reported a maximum of 110 switches for one session where the real
+        # figure was 14, and that fabricated number fired a rollback trigger.
+        #
+        # This is the same subject/payload key confusion that TEST-MATRIX
+        # already records as having broken a diagnostic once, and that broke the
+        # stillborn-session check in fleet-health yesterday. Third time.
+        per_session: Dict[str, int] = {}
+        for row in conn.execute(
+            "SELECT subject, payload FROM events "
+            "WHERE kind='route.changed' AND at>?", (since,)
+        ):
+            try:
+                payload = json.loads(row["payload"])
+            except (TypeError, ValueError):
+                continue
+            if payload.get("from") and payload.get("to") \
+                    and payload["from"] != payload["to"]:
+                key = str(row["subject"])
+                per_session[key] = per_session.get(key, 0) + 1
+        out["sessions_that_switched"] = len(per_session)
+        out["max_switches_for_one_session"] = max(per_session.values() or [0])
+
+        out["state_size"] = {
+            "events": conn.execute("SELECT count(*) FROM events").fetchone()[0],
+            "executions_active": conn.execute(
+                "SELECT count(*) FROM executions WHERE status='active'"
+            ).fetchone()[0],
+        }
+    finally:
+        conn.close()
+    return out
+
+
+# Each criterion: (key, human text, judge(before, after) -> Optional[bool])
+# None means "cannot judge from this data" — reported as such rather than
+# silently counted as a pass, which is the failure mode this whole file exists
+# to avoid.
+# Applies to every phase. A change that makes routing decisions slower is a
+# regression whatever else it improved: the data plane holds the request at 15s,
+# and a held request is a wait the owner sees. This is the criterion the
+# `decide-latency-before` baseline was taken for and did not have — a baseline
+# whose tool cannot judge it exits 1 as "cannot judge", which is correct but
+# useless.
+_UNIVERSAL = [
+    ("decisions_not_slower",
+     "慢决策没有变多",
+     # None when the BASELINE predates this metric. Treating a missing baseline
+     # as zero would read every first comparison as a regression, and a
+     # criterion that cries wolf on its own introduction is worse than none —
+     # `decide-latency-before` was taken before the coordinator recorded any of
+     # this, and reporting it as failed would be a lie about what was measured.
+     lambda b, a: (None if b.get("slow_decisions") is None
+                        or a.get("slow_decisions") is None
+                   else a["slow_decisions"] <= b["slow_decisions"])),
+    ("no_decision_near_timeout",
+     "没有决策逼近数据面超时",
+     # Two thirds of the 15s the data plane waits. A single decision here means
+     # a little more concurrency starts holding requests for real. Judged on
+     # the AFTER sample alone, so it needs no baseline.
+     lambda b, a: (None if a.get("worst_decision_seconds") is None
+                   else a["worst_decision_seconds"] < 10.0)),
+]
+
+
+def _criteria(phase: str):
+    if phase == "phase1":
+        return _UNIVERSAL + [
+            ("switch_ahead_happens",
+             "reason=switch_ahead 出现过",
+             # None when the scenario never arose. switch-ahead moves an
+             # ESTABLISHED session off a nearly-spent account, so it needs both
+             # conditions at once: an account inside the margin AND a session
+             # sitting on it. Measured in the first soak: hello@ spent 139
+             # readings inside the band and received zero routes in 24 hours —
+             # its last lease predated the soak. Nothing to move, so nothing
+             # fired, and calling that a failure would be a lie in the other
+             # direction.
+             lambda b, a: (True if a.get("route_reasons", {}).get("switch_ahead", 0) > 0
+                           else (False if a.get("switch_ahead_opportunities", 0) > 0
+                                 else None))),
+            ("no_ceiling",
+             "没有账号再撞到 100%",
+             lambda b, a: (a.get("accounts_at_ceiling") is not None
+                           and a["accounts_at_ceiling"]
+                           <= b.get("accounts_at_ceiling", 0))),
+            ("no_flapping",
+             "单会话换号次数没有上升",
+             lambda b, a: (a.get("max_switches_for_one_session", 0)
+                           <= max(1, b.get("max_switches_for_one_session", 0)))),
+            ("parks_not_worse",
+             "等待没有变多",
+             lambda b, a: _ratio(a) <= _ratio(b) + 0.05),
+        ]
+    return list(_UNIVERSAL)
+
+
+def _ratio(sample: Dict[str, Any]) -> float:
+    routes = sample.get("routes") or 0
+    parks = sample.get("parks") or 0
+    total = routes + parks
+    return (parks / total) if total else 0.0
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="measure acceptance, not tests")
+    sub = parser.add_subparsers(dest="command", required=True)
+    take = sub.add_parser("baseline")
+    take.add_argument("name")
+    cmp_ = sub.add_parser("compare")
+    cmp_.add_argument("name")
+    cmp_.add_argument("--phase", default="phase1")
+    sub.add_parser("list")
+    args = parser.parse_args(argv)
+
+    STORE.mkdir(parents=True, exist_ok=True)
+
+    if args.command == "list":
+        for path in sorted(STORE.glob("*.json")):
+            data = json.loads(path.read_text(encoding="utf-8"))
+            print("  %-24s %s  head=%s" % (
+                path.stem,
+                time.strftime("%Y-%m-%d %H:%M", time.localtime(data.get("at", 0))),
+                data.get("head")))
+        return 0
+
+    if args.command == "baseline":
+        sample = measure()
+        path = STORE / f"{args.name}.json"
+        if path.exists():
+            print(f"{path} 已存在 —— 基线不覆盖：改之后再取一次就不是基线了",
+                  file=sys.stderr)
+            return 2
+        path.write_text(json.dumps(sample, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+        print(f"基线已记录：{path}")
+        print(json.dumps({k: v for k, v in sample.items()
+                          if k in ("routes", "parks", "accounts_at_ceiling",
+                                  "slow_decisions", "worst_decision_seconds",
+                                   "max_switches_for_one_session", "head")},
+                         ensure_ascii=False))
+        return 0
+
+    path = STORE / f"{args.name}.json"
+    if not path.exists():
+        print(f"没有基线 {args.name} —— 无法验收。基线必须在改动前取。",
+              file=sys.stderr)
+        return 2
+    before = json.loads(path.read_text(encoding="utf-8"))
+    after = measure()
+
+    if before.get("head") == after.get("head"):
+        print("⚠ 基线和现在是同一个 commit —— 还没有任何改动可验收\n")
+
+    print(f"基线 {args.name}（{time.strftime('%m-%d %H:%M', time.localtime(before['at']))}"
+          f"，head={before.get('head')}）→ 现在（head={after.get('head')}）\n")
+    print("  %-28s %14s %14s" % ("", "改动前", "改动后"))
+    for key in ("routes", "parks", "accounts_at_ceiling",
+                "slow_decisions", "worst_decision_seconds",
+                "sessions_that_switched", "max_switches_for_one_session"):
+        print("  %-28s %14s %14s" % (key, before.get(key), after.get(key)))
+    print("  %-28s %13.1f%% %13.1f%%" % ("park 占比", _ratio(before) * 100,
+                                         _ratio(after) * 100))
+    wait_before = (before.get("waiting") or {}).get("avoidable")
+    wait_after = (after.get("waiting") or {}).get("avoidable")
+    print("  %-28s %14s %14s" % ("本可避免的等待", wait_before, wait_after))
+
+    print()
+    failures = 0
+    unknown = 0
+    for _, text, judge in _criteria(args.phase):
+        try:
+            verdict = judge(before, after)
+        except Exception:
+            verdict = None
+        if verdict is None:
+            unknown += 1
+            print(f"  ? {text} —— 数据不足以判定")
+        elif verdict:
+            print(f"  ✓ {text}")
+        else:
+            failures += 1
+            print(f"  ✗ {text}")
+
+    print()
+    if failures:
+        print(f"未通过验收：{failures} 条不达标。再跑一次测试解决不了。")
+        return 1
+    if unknown:
+        print(f"无法判定：{unknown} 条缺数据。补齐观测再验收，不要当成通过。")
+        return 1
+    print("验收通过（基于生产观测，不是测试结果）")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

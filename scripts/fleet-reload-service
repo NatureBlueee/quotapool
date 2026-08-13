@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+"""Replace a LaunchAgent's plist without being able to leave it stopped.
+
+    fleet-reload-service com.claude-fleet.dataplane new.plist --probe URL
+    fleet-reload-service claude-fleet-dataplane --restart-only --probe URL
+
+macOS uses launchd, the server uses systemd. Same guarantees, different
+mechanics — and the difference matters: `systemctl restart` stops and starts in
+one synchronous step, so the race below cannot happen there. Codifying both
+here is the point; a tool that only covers one host means the other gets done
+by hand, which is how this incident started.
+
+## Why this exists
+
+`launchctl bootout` returns before the job is gone. Issuing `bootstrap`
+immediately fails with `Bootstrap failed: 5: Input/output error`, and the
+service is now stopped with nothing running.
+
+That is not a hypothesis. It took the data plane down: bootout, immediate
+bootstrap, EIO, port 13456 unbound, live sessions refused. Reproduced
+afterwards on an isolated label whose program lingers six seconds on SIGTERM —
+
+    bootout; bootstrap                    -> Bootstrap failed: 5
+    bootout; poll until gone; bootstrap   -> ok
+
+The coordinator never showed it because Python exits on SIGTERM at once. The
+data plane is Node with live connections, so its teardown outlasted the gap.
+
+## What this guarantees
+
+1. The new plist is syntactically valid (`plutil -lint`) before anything stops.
+2. launchd accepts its keys, proven on a SHADOW label with a harmless program,
+   before anything stops. A rejected `ProcessType`, a malformed array, a key
+   this launchd does not know — all surface here, with the service still up.
+3. The old plist is copied aside before it is replaced.
+4. `bootout` is followed by polling until the label is really gone.
+5. If bootstrap fails, or the probe does not answer, the OLD plist is put back
+   and started — with the same polling — before this exits non-zero.
+
+What it cannot do is verify the new configuration under load without taking the
+port. The shadow proves launchd accepts the plist; the probe proves the real
+service answers afterwards. Between those two there is a window, and the
+rollback exists for it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import plistlib
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Optional
+
+# Teardown is what we are waiting out. Six seconds covers the reproduction
+# case; twenty is generous for a data plane draining live connections, and
+# still short enough that a hung teardown is reported rather than waited on
+# for ever.
+GONE_TIMEOUT_SECONDS = 20.0
+GONE_POLL_SECONDS = 0.25
+
+# After bootstrap, before declaring success. A service that starts and then
+# fails to answer is a service that is down.
+PROBE_TIMEOUT_SECONDS = 30.0
+PROBE_POLL_SECONDS = 0.5
+
+
+def say(message: str, err: bool = False) -> None:
+    """Flushed on every line.
+
+    stdout to a pipe is block-buffered while stderr is not, so a failure
+    printed to stderr appears BEFORE the steps that led to it — which is
+    exactly the wrong order for a log someone reads after an incident.
+    """
+    stream = sys.stderr if err else sys.stdout
+    print(message, file=stream)
+    stream.flush()
+
+
+SYSTEMD = sys.platform.startswith("linux")
+
+
+def _domain() -> str:
+    return "gui/%d" % os.getuid()
+
+
+def _systemd_restart(unit: str) -> Optional[str]:
+    """systemctl restart is synchronous: it will not return before the old
+    process is gone. That is the whole race this tool exists for on macOS, and
+    systemd simply does not have it."""
+    result = _run(["sudo", "systemctl", "restart", unit])
+    if result.returncode != 0:
+        return "systemctl restart failed: %s" % (
+            result.stderr.strip() or result.stdout.strip())
+    active = _run(["systemctl", "is-active", unit])
+    if active.stdout.strip() != "active":
+        return "unit is %s after restart" % (active.stdout.strip() or "unknown")
+    return None
+
+
+def _run(args: list, check: bool = False) -> subprocess.CompletedProcess:
+    return subprocess.run(args, capture_output=True, text=True, check=check,
+                          timeout=60)
+
+
+def _loaded(label: str) -> bool:
+    return _run(["launchctl", "print", f"{_domain()}/{label}"]).returncode == 0
+
+
+def _wait_gone(label: str) -> bool:
+    deadline = time.time() + GONE_TIMEOUT_SECONDS
+    while time.time() < deadline:
+        if not _loaded(label):
+            return True
+        time.sleep(GONE_POLL_SECONDS)
+    return False
+
+
+def _bootout(label: str) -> None:
+    _run(["launchctl", "bootout", f"{_domain()}/{label}"])
+
+
+def _bootstrap(plist: Path) -> subprocess.CompletedProcess:
+    return _run(["launchctl", "bootstrap", _domain(), str(plist)])
+
+
+def _lint(plist: Path) -> None:
+    result = _run(["plutil", "-lint", str(plist)])
+    if result.returncode != 0:
+        raise RuntimeError("plutil rejected %s: %s"
+                           % (plist, result.stdout.strip() or result.stderr.strip()))
+
+
+def _shadow_check(plist: Path, workdir: Path) -> None:
+    """Does launchd accept these keys? Answered while the service is still up.
+
+    The program is replaced with `/usr/bin/true` and the label with a private
+    one: this is a test of the CONFIGURATION, not of the binary, and it must
+    not race the real service for a port.
+    """
+    data = plistlib.loads(plist.read_bytes())
+    label = "shadow.fleet-reload.%d" % os.getpid()
+    data["Label"] = label
+    data["ProgramArguments"] = ["/usr/bin/true"]
+    data.pop("Program", None)
+    data["RunAtLoad"] = False
+    for key in ("KeepAlive", "StartInterval", "StandardOutPath",
+                "StandardErrorPath"):
+        data.pop(key, None)
+
+    shadow = workdir / f"{label}.plist"
+    shadow.write_bytes(plistlib.dumps(data))
+    try:
+        _lint(shadow)
+        _bootout(label)
+        _wait_gone(label)
+        result = _bootstrap(shadow)
+        if result.returncode != 0:
+            raise RuntimeError(
+                "launchd refused the new configuration on a shadow label "
+                "(nothing was stopped): %s"
+                % (result.stderr.strip() or result.stdout.strip()))
+    finally:
+        _bootout(label)
+        shadow.unlink(missing_ok=True)
+
+
+def _probe(url: str) -> Optional[str]:
+    deadline = time.time() + PROBE_TIMEOUT_SECONDS
+    last = "never attempted"
+    while time.time() < deadline:
+        try:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}))
+            with opener.open(url, timeout=3) as response:
+                if response.status == 200:
+                    return None
+                last = "HTTP %s" % response.status
+        except Exception as exc:                       # noqa: BLE001
+            last = str(exc)[:120]
+        time.sleep(PROBE_POLL_SECONDS)
+    return last
+
+
+def _install(label: str, plist_path: Path, source: Path, probe: Optional[str],
+             what: str) -> Optional[str]:
+    """Put `source` at `plist_path`, start it, and confirm it answers.
+
+    `source` may BE `plist_path`. Passing the live plist is the obvious way to
+    ask for "restart with the configuration it already has", and it used to
+    raise SameFileError out of `shutil.copyfile` — an unhandled traceback where
+    a plain answer belongs. It crashed before stopping anything, so no harm
+    came of it, but that was ordering luck rather than design.
+    """
+    if source.resolve() != plist_path.resolve():
+        shutil.copyfile(source, plist_path)
+    _bootout(label)
+    if not _wait_gone(label):
+        return "%s: the old job did not finish tearing down in %gs" % (
+            what, GONE_TIMEOUT_SECONDS)
+    result = _bootstrap(plist_path)
+    if result.returncode != 0:
+        return "%s: bootstrap failed: %s" % (
+            what, result.stderr.strip() or result.stdout.strip())
+    if probe:
+        failure = _probe(probe)
+        if failure:
+            return "%s: started but %s did not answer (%s)" % (
+                what, probe, failure)
+    return None
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        description="swap a LaunchAgent plist with a verified rollback")
+    parser.add_argument("label")
+    parser.add_argument("new_plist", nargs="?")
+    parser.add_argument("--probe", help="URL that must answer 200 afterwards")
+    parser.add_argument("--restart-only", action="store_true",
+                        help="pick up new code; do not touch the unit/plist")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args(argv)
+
+    if args.restart_only:
+        # No configuration is changing, so there is nothing to shadow-test and
+        # nothing to roll back TO. The probe is the whole guarantee: if the new
+        # code does not answer, this says so loudly instead of exiting 0 on a
+        # service that started and died.
+        say("  重启以载入新代码（不改配置）")
+        if args.dry_run:
+            say("  （干跑：未重启）")
+            return 0
+        if SYSTEMD:
+            failure = _systemd_restart(args.label)
+        else:
+            _bootout(args.label)
+            if not _wait_gone(args.label):
+                failure = "旧 job 未在 %gs 内拆解完成" % GONE_TIMEOUT_SECONDS
+            else:
+                result = _bootstrap(
+                    Path.home() / "Library" / "LaunchAgents"
+                    / f"{args.label}.plist")
+                failure = None if result.returncode == 0 else (
+                    "bootstrap failed: %s" % (result.stderr.strip()
+                                              or result.stdout.strip()))
+        if failure is None and args.probe:
+            probe_failure = _probe(args.probe)
+            if probe_failure:
+                failure = "已启动但 %s 无响应（%s）" % (args.probe, probe_failure)
+        if failure:
+            say("     %s" % failure, err=True)
+            say("     配置未被改动；如需回退请还原代码后重跑。", err=True)
+            return 1
+        say("     成功")
+        return 0
+
+    if not args.new_plist:
+        say("需要提供新 plist，或使用 --restart-only", err=True)
+        return 2
+    if SYSTEMD:
+        say("systemd 主机上只支持 --restart-only（unit 文件属 root，"
+            "改动请走配置管理）", err=True)
+        return 2
+
+    agents = Path.home() / "Library" / "LaunchAgents"
+    live = agents / f"{args.label}.plist"
+    incoming = Path(args.new_plist).expanduser().resolve()
+
+    if not incoming.is_file():
+        say("找不到新 plist：%s" % incoming, err=True)
+        return 2
+    if not live.is_file():
+        say("找不到现行 plist：%s" % live, err=True)
+        return 2
+
+    workdir = Path(os.environ.get("TMPDIR", "/tmp")) / "fleet-reload"
+    workdir.mkdir(parents=True, exist_ok=True)
+    backup = workdir / f"{args.label}.backup.{int(time.time())}.plist"
+    shutil.copyfile(live, backup)
+
+    if incoming.resolve() == live.resolve():
+        say("  注：传入的就是现行 plist —— 配置不变，等同于重启载入新代码")
+
+    say("  ① plutil 校验新 plist")
+    try:
+        _lint(incoming)
+    except RuntimeError as exc:
+        say("     %s" % exc, err=True)
+        return 1
+    say("     通过")
+
+    say("  ② 影子 label 试装（服务仍在运行）")
+    try:
+        _shadow_check(incoming, workdir)
+    except RuntimeError as exc:
+        say("     %s" % exc, err=True)
+        say("     服务未被停止。", err=True)
+        return 1
+    say("     launchd 接受该配置")
+
+    if args.dry_run:
+        say("  （干跑：到此为止，正式服务未动）")
+        say("     备份在 %s" % backup)
+        return 0
+
+    say("  ③ 备份现行 plist → %s" % backup)
+    say("  ④ 停止 → 等待彻底消失 → 用新 plist 启动")
+    failure = _install(args.label, live, incoming, args.probe, "新配置")
+    if failure is None:
+        say("     成功")
+        return 0
+
+    say("     %s" % failure, err=True)
+    say("  ⑤ 回滚到备份的 plist", err=True)
+    rollback = _install(args.label, live, backup, args.probe, "回滚")
+    if rollback is None:
+        say("     回滚成功，服务已恢复为原配置", err=True)
+        return 1
+    say("     回滚也失败了：%s" % rollback, err=True)
+    print("     手动恢复：cp %s %s && launchctl bootstrap %s %s"
+          % (backup, live, _domain(), live), file=sys.stderr)
+    return 3
+
+
+if __name__ == "__main__":
+    sys.exit(main())

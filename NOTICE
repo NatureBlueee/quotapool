@@ -1,0 +1,73 @@
+Quotapool
+============
+
+This project is two layers, and they have different origins. Saying so at the
+top level matters: the derivation was previously recorded only in
+`vendor/teamclaude/VENDOR-NOTICE.md`, which nobody landing on the repository
+would see.
+
+
+Data plane — a fork
+-------------------
+
+`vendor/teamclaude/` is derived from **TeamClaude**:
+
+    @karpeleslab/teamclaude 1.1.11
+    https://github.com/KarpelesLab/teamclaude
+    Copyright (c) 2026 KarpelesLab
+    MIT License — retained verbatim in vendor/teamclaude/LICENSE
+
+Obtained from the npm registry on 2026-07-28. The upstream tarball's SHA-256 and
+npm integrity hash are recorded in `vendor/teamclaude/VENDOR-NOTICE.md`, along
+with a per-item list of what was changed.
+
+TeamClaude continues to own OAuth refresh, the MITM proxy, SSE forwarding, the
+request-body account UUID rewrite, and quota-rejection retry. The fork does not
+claim upstream endorsement.
+
+In broad terms the fork:
+
+- delegates account selection to a loopback-only Fleet coordinator before an
+  upstream request begins, and fails closed if that coordinator is unreachable;
+- accepts subscription OAuth accounts only, binds to loopback, and disables
+  keep-warm and self-update;
+- refuses sx.org egress routing outright (see "Deliberate omissions" below).
+
+
+Control plane — original
+------------------------
+
+`src/claude_fleet/`, `scripts/`, `bin/`, `tests/` and the packaging are original
+work under the MIT licence in `LICENSE`.
+
+
+Not affiliated with Anthropic
+-----------------------------
+
+Quotapool is not an Anthropic product and carries no Anthropic endorsement.
+"Claude" and "Claude Code" are Anthropic's. This is a self-hosted local tool that
+runs on your own machine, holds your own credentials, and routes your own
+requests to subscriptions you hold yourself. It is not a hosted service, it does
+not offer sign-in to anyone, and it never routes requests on behalf of a third
+party.
+
+
+Deliberate omissions
+--------------------
+
+Several things upstream offers are removed rather than merely unused, and they
+are a product position rather than an unfinished feature:
+
+- **No API keys and no usage credits.** Nothing here can create spend outside a
+  subscription you already pay for.
+- **No third-party upstreams.** Upstream supports routing to Anthropic-compatible
+  APIs as a fallback; that is removed.
+- **No IP evasion.** Upstream can provision a residential proxy to work around
+  IP-based rate limits. That path is refused at startup and again on every
+  config reload.
+
+Not another name
+----------------
+
+`claude-fleet` on npm is an unrelated project by a different author. There is no
+shared code, history, or affiliation.

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.claude-fleet.tokens</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@HOME@/.local/share/claude-fleet/scripts/fleet-tokens</string>
+    <string>--collect</string>
+    <string>--quiet</string>
+  </array>
+  <!-- Every minute, and it has been running on both of this project's hosts
+       since long before it was in the repository — which is the reason this
+       file exists. `scripts/fleet-tokens` shipped; nothing ever started it, so
+       a fresh install got the collector and never ran it. Quota readings would
+       simply stop updating, and every routing decision is made from them: an
+       account whose reading is frozen at "spent" gets no traffic, so it never
+       learns otherwise. Silent, and indistinguishable from a quiet fleet. -->
+  <key>StartInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>@HOME@/.local/state/claude-fleet/tokens.log</string>
+  <key>StandardErrorPath</key><string>@HOME@/.local/state/claude-fleet/tokens.error.log</string>
+  <!-- Batch work nobody is waiting on, unlike the coordinator and data plane. -->
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+</dict>
+</plist>

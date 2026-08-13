@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""Build the publishable tree, and refuse to build a leaky one.
+
+    fleet-make-release --check          scan only, change nothing
+    fleet-make-release --out DIR        write the public tree
+
+## Why an allow-list
+
+The repository is also this fleet's operations record: deploy logs, repair
+notes, cross-host audits, an account inventory. Those are worth keeping and are
+nobody else's business. A deny-list would have to anticipate every future file;
+an allow-list only has to name what a stranger needs, and anything new is
+excluded until someone decides otherwise.
+
+## Why the scan is separate from the list
+
+Being on the list is not evidence of being clean. `desktop/verify/snap.json` is
+a legitimate test fixture and it carried five real account UUIDs and three real
+email addresses. So the tree gets scanned after assembly, and a hit fails the
+build rather than printing a warning nobody reads.
+
+## Why a tree and not a clone
+
+This copies files. It does not publish git history, and that is the point:
+history holds 108 commits of this fleet's operational life, including thirteen
+email addresses in commit messages and comments that predate the scrub. Scanned
+and verified clean of credentials — but "clean of credentials" is a lower bar
+than "fit to publish", and rewriting history to clear the rest would be a lot of
+risk for something nobody outside needs.
+
+The public repository starts from this tree.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import List, Optional
+
+REPO = Path(__file__).resolve().parent.parent
+
+# Everything a stranger needs to run this, and nothing else.
+PUBLISH = [
+    ".gitignore",
+    ".github",              # CI, issue and pull-request templates
+    "LICENSE",
+    "NOTICE",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+    "CODE_OF_CONDUCT.md",
+    "CHANGELOG.md",
+    "README.md",
+    "README.zh-CN.md",
+    "ARCHITECTURE.md",
+    "OPTIMIZER.md",
+    "TEST-MATRIX.md",
+    "THREAT-MODEL.md",
+    "pyproject.toml",
+    "install.sh",
+    "bin",
+    "src",
+    "tests",
+    "scripts",
+    "packaging",
+    "shims",
+    "vendor",
+    "docs",
+]
+
+# Kept, not published. Listed explicitly rather than left to fall through the
+# allow-list, so that deciding to keep something private is a decision somebody
+# made rather than an omission.
+PRIVATE = [
+    "ACCOUNTS.md",              # account inventory
+    "CROSS-HOST-AUDIT-001.md",  # incident write-ups naming real hosts
+    "CROSS-HOST-RESULT.md",
+    "DEPLOY-LOG-20260730.md",
+    "REPAIR-NOTES-20260730.md",
+    "UNIFIED-QUOTA-PLAN.md",
+    "FABLE-NOTES.md",
+    "OPERATIONS.md",       # 这台机器的运维记录, 原 README
+    "BUILD-PLAN.md",
+    "RELEASE-READINESS.md",
+    "OSS_AUDIT.md",        # 发布前审计, 引用了本机路径和内部主机名
+    "desktop",                  # a macOS panel bound to this machine's layout
+    "etc",
+    "uv.lock",   # 锁的是本机的解析结果, 对别人无意义
+]
+
+# Patterns that must not appear in a published tree. Deliberately broad: a false
+# positive costs a minute, a miss costs a credential or somebody's address.
+FORBIDDEN = [
+    # Length is the discriminator, not the prefix. A real token is 108
+    # characters; the fixtures throughout the test suite are things like
+    # `sk-ant-oat01-live`, and a rule that flagged those would flag 30 lines of
+    # honest test data and get ignored within a week.
+    # ...and a value that says of itself that it is not one is not one. Three
+    # places deliberately carry a long, obviously-fake token: the launcher's
+    # sentinel (which Claude Code requires in order to enter inference-only
+    # mode) and the shadow instance's two. Naming the convention beats
+    # enumerating the files, which would rot.
+    (r"sk-ant-[a-z0-9]+-(?![A-Za-z0-9_-]*not-a-credential)[A-Za-z0-9_-]{40,}",
+     "看起来像真的 Anthropic 令牌"),
+    # Fake domains that appear in examples, upstream's and ours.
+    (r"[A-Za-z0-9._%+-]+@(?!example\.|x\.com|host\b)[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+     "邮箱地址"),
+    (r"/Users/[a-z][a-z0-9_-]*/", "某个人的家目录"),
+    # `someone` and `user` are the placeholders documentation uses; a real
+    # username is what must not ship.
+    (r"/home/(?!nature\b|someone\b|user\b)[a-z][a-z0-9_-]*/", "某个人的家目录"),
+    (r"\bhs-t[a-z]\b", "内部主机名"),
+]
+
+# Files where a match is expected and correct.
+EXEMPT = {
+    # Upstream's own README, published as we received it.
+    "vendor/teamclaude/README.md",
+    "vendor/teamclaude/LICENSE",
+    "vendor/teamclaude/VENDOR-NOTICE.md",
+    # Names its own upstream author and repository, which is the point.
+    "NOTICE",
+}
+
+TEXT_SUFFIXES = {".py", ".js", ".sh", ".md", ".json", ".toml", ".plist",
+                 ".swift", ".txt", ""}
+
+
+def _tracked() -> List[str]:
+    return subprocess.run(["git", "-C", str(REPO), "ls-files"],
+                          capture_output=True, text=True).stdout.split()
+
+
+def _published(paths: List[str]) -> List[str]:
+    out = []
+    for name in paths:
+        top = name.split("/", 1)[0]
+        if top in PRIVATE:
+            continue
+        if top in PUBLISH or name in PUBLISH:
+            out.append(name)
+    return out
+
+
+def scan(names: List[str]) -> List[str]:
+    problems = []
+    for name in names:
+        if name in EXEMPT:
+            continue
+        path = REPO / name
+        if path.suffix not in TEXT_SUFFIXES:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        for pattern, why in FORBIDDEN:
+            for match in re.finditer(pattern, text):
+                line = text[:match.start()].count("\n") + 1
+                problems.append("%s:%d  %s: %s"
+                                % (name, line, why, match.group(0)[:60]))
+    return problems
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(prog="fleet-make-release")
+    parser.add_argument("--out", help="写出公开树到这个目录")
+    parser.add_argument("--check", action="store_true", help="只扫描, 不写任何东西")
+    args = parser.parse_args(argv)
+
+    tracked = _tracked()
+    names = _published(tracked)
+
+    unclaimed = sorted({
+        n.split("/", 1)[0] for n in tracked
+        if n.split("/", 1)[0] not in PUBLISH
+        and n.split("/", 1)[0] not in PRIVATE
+        and n not in PUBLISH
+    })
+
+    print("  跟踪 %d 个文件 · 公开 %d 个" % (len(tracked), len(names)))
+    if unclaimed:
+        # Excluded by default, but named — a file nobody has decided about
+        # should not silently vanish from a release either.
+        print("  %d 项既不在公开清单也不在私有清单, 默认不发布:" % len(unclaimed))
+        for item in unclaimed:
+            print("      %s" % item)
+
+    problems = scan(names)
+    if problems:
+        print("\n  ✗ 公开树里有不该出现的东西 (%d 处):" % len(problems),
+              file=sys.stderr)
+        for problem in problems[:40]:
+            print("      %s" % problem, file=sys.stderr)
+        if len(problems) > 40:
+            print("      … 还有 %d 处" % (len(problems) - 40), file=sys.stderr)
+        return 1
+    print("  ✓ 公开树扫描干净")
+
+    if args.check or not args.out:
+        return 0
+
+    out = Path(args.out).expanduser()
+    if out.exists():
+        print("  %s 已存在 —— 拒绝覆盖" % out, file=sys.stderr)
+        return 2
+    for name in names:
+        target = out / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPO / name, target)
+        target.chmod((REPO / name).stat().st_mode & 0o777)
+    print("  已写出 → %s" % out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

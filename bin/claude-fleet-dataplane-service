@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+RUNTIME=${FLEET_RUNTIME_CONFIG:-"$HOME/.config/claude-fleet/runtime.json"}
+TEAM_CONFIG=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["teamclaude_config"])' "$RUNTIME")
+PREFIX=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["prefix"])' "$RUNTIME")
+NODE=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["node_binary"])' "$RUNTIME")
+OUTBOUND_PROXY=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("outbound_proxy", ""))' "$RUNTIME")
+NO_PROXY_VALUE=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("no_proxy", "localhost,127.0.0.1,::1"))' "$RUNTIME")
+export TEAMCLAUDE_CONFIG="$TEAM_CONFIG"
+export TEAMCLAUDE_DISABLE_AUTOUPDATE=1
+if [ -n "$OUTBOUND_PROXY" ]; then
+  export HTTPS_PROXY="$OUTBOUND_PROXY"
+  export HTTP_PROXY="$OUTBOUND_PROXY"
+  export ALL_PROXY="$OUTBOUND_PROXY"
+fi
+export NO_PROXY="$NO_PROXY_VALUE"
+if "$NODE" --help 2>/dev/null | grep -q -- '--use-env-proxy'; then
+  exec "$NODE" --use-env-proxy "$PREFIX/vendor/teamclaude/src/index.js" server --headless
+fi
+exec "$NODE" "$PREFIX/vendor/teamclaude/src/index.js" server --headless

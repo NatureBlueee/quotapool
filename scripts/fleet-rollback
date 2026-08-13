@@ -1,0 +1,766 @@
+#!/usr/bin/env python3
+"""Go back to a version that was known to work. One command, either host, no me.
+
+    fleet-rollback list              what is known good, newest first
+    fleet-rollback now               go to the newest known-good point
+    fleet-rollback to <sha>          go to a specific commit
+    fleet-rollback mark [<sha>]      record HEAD (or <sha>) as known good
+    fleet-rollback --dry-run ...     say what it would do, change nothing
+
+## Why this exists
+
+The owner said it plainly: during a repair the fleet became completely
+unusable, and that must never happen. What was missing was not care — it was
+the ability to UNDO without the person who broke it.
+
+Every rollback so far has been me, by hand: git checkout, rsync the right files
+to the right paths, restart the right services in the right order, check. Each
+step is one I have already got wrong in this session — files rsynced to a
+directory instead of a path, a service booted out before its replacement was
+proven, a plist swapped without checking the old job had gone.
+
+So this is deliberately not clever. It restores files git already has, to paths
+git already knows, on both hosts, then restarts and PROVES the result answers.
+If it cannot prove that, it says so and names the command to try next.
+
+## What "known good" means
+
+Not "the tests passed" — that has been green through two outages. And not
+"healthy right now" either: every outage in this system's worst day appeared
+minutes after a deploy that had just passed every check, so a mark taken at
+deploy time is very nearly worthless.
+
+A point is marked only when the version has been LIVE for SOAK_HOURS, produced
+no slow routing decisions on either host in that time, and both hosts are
+serving with a clean `fleet doctor` at the moment of marking. `--force` skips
+the soak, and says so — that is the operator's judgement, not the tool's.
+
+A periodic job attempts the mark hourly, so stable points accumulate without
+anyone remembering to.
+
+## What it does not do
+
+- Touch the database. Rolling code back is safe; rolling state back is not, and
+  a schema written by a newer version is not something git can undo.
+- Roll back the plists or the unit files. Those live outside the repo on
+  purpose; `fleet-reload-service` owns that with its own backup and rollback.
+- Guess. If the working tree has uncommitted changes it stops, because the
+  thing you would lose is exactly the thing you were in the middle of.
+"""
+
+from __future__ import annotations
+
+
+def _peer_host() -> str:
+    """The other host, from config rather than a literal.
+
+    It used to be a hardcoded hostname, which is both un-publishable and wrong
+    for anyone else's fleet: they would have to edit source to use their own
+    machine. runtime.json already carries this host's identity; the peer belongs
+    next to it.
+    """
+    if os.environ.get("FLEET_PEER"):
+        return os.environ["FLEET_PEER"]
+    try:
+        import json as _json
+        runtime = _json.loads(
+            (pathlib.Path(os.environ.get(
+                "FLEET_RUNTIME_CONFIG",
+                str(pathlib.Path.home() / ".config" / "claude-fleet" / "runtime.json"))
+            )).read_text(encoding="utf-8"))
+        return str(runtime.get("peer_host") or "")
+    except Exception:                                         # noqa: BLE001
+        return ""
+
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+import pathlib
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+REPO = Path(__file__).resolve().parent.parent
+MARKS = Path.home() / ".local" / "state" / "claude-fleet" / "known-good.jsonl"
+# When this commit was first seen running. Rewritten whenever HEAD changes, so
+# "how long has this version been live" is answerable without guessing from
+# commit timestamps, which say when it was WRITTEN.
+SEEN = Path.home() / ".local" / "state" / "claude-fleet" / "head-first-seen.json"
+
+# A version earns "known good" by surviving, not by looking fine the moment it
+# lands. Every outage in this system's worst day appeared minutes after a
+# deploy that had just passed every check — so a mark taken at deploy time is
+# very nearly worthless, which is what it was until now.
+#
+# Two hours is not a proof. It is long enough to cover a burst of real traffic
+# and the coordinator's own 24h lease cycle starting to turn over, and short
+# enough that a good version becomes available to roll back TO on the same day.
+SOAK_HOURS = 2.0
+PEER = _peer_host()
+PEER_REPO = "/home/nature/.local/share/claude-fleet"
+
+# Only these are deployed. The repo holds tests, docs and packaging that the
+# running fleet never reads, and copying them would turn a rollback into a
+# bigger change than the thing it is undoing.
+DEPLOYED = [
+    "src/claude_fleet",
+    "scripts",
+    "vendor/teamclaude/src",
+    # Templates only, and worth being precise about what that buys: syncing them
+    # keeps a later `install-systemd.sh` from generating units off a version the
+    # code no longer matches. It does NOT roll back the units already installed
+    # in ~/Library/LaunchAgents or /etc/systemd — those are `fleet-reload-service`'s
+    # job, and a rollback that also needs a unit change still needs that step.
+    "packaging",
+]
+
+COORDINATOR_HEALTH = "http://127.0.0.1:17891/health"
+DATAPLANE_READY = "http://127.0.0.1:13456/teamclaude/ready"
+
+
+def say(message: str, err: bool = False) -> None:
+    stream = sys.stderr if err else sys.stdout
+    print(message, file=stream)
+    stream.flush()
+
+
+def _git(*args: str) -> str:
+    result = subprocess.run(["git", "-C", str(REPO), *args],
+                            capture_output=True, text=True, timeout=60)
+    if result.returncode != 0:
+        raise RuntimeError("git %s: %s" % (" ".join(args), result.stderr.strip()))
+    return result.stdout.strip()
+
+
+def _probe(url: str, host: Optional[str] = None) -> bool:
+    """Any HTTP answer counts. The question is whether it is turning."""
+    cmd = ["curl", "-s", "-o", "/dev/null", "--max-time", "8",
+           "-w", "%{http_code}", url]
+    if host:
+        cmd = ["ssh", "-o", "ConnectTimeout=8", host] + [" ".join(cmd)]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    code = result.stdout.strip()
+    return code.isdigit() and code != "000"
+
+
+# Checks `doctor` runs that say nothing about whether this VERSION works.
+#
+# Marking is a claim about a commit: does the code that is running serve? How
+# many subscriptions the owner currently owns is not a property of the commit,
+# and conflating the two is not academic — it jammed this mechanism shut for
+# five days and nobody noticed.
+#
+# The chain: accounts got banned, so one of six stayed enabled, so
+# `two_enabled_oauth_accounts` failed, so `doctor` was never clean, so `mark`
+# refused every hour, so the newest known-good point stayed 126 hours old — a
+# commit that predates `fleet-watchdog`, `claude-direct` and `backup.py`. An
+# automatic rollback would have deleted the watchdog as its first act, and then
+# nothing would have been left to notice that the rollback had not helped.
+#
+# A deny-list rather than an allow-list, deliberately. A doctor check added next
+# month falls INSIDE an allow-list's blind spot and mark would certify a version
+# it would have failed — unsafe, and silent. Under a deny-list a new capacity
+# check jams the gate again, which is wrong but loud, and the staleness alarm in
+# `fleet-watchdog` now says so within a day.
+_NOT_ABOUT_THE_VERSION = (
+    "two_enabled_oauth_accounts",   # how many subscriptions are usable today
+    "no_account_needs_relogin",     # whose token expired
+    "account_quota_fresh",          # how recently quota was observed
+    "request_path_not_throttled",   # whether Anthropic is rate-limiting you
+)
+
+
+# What each host is actually running, as one number.
+#
+# A mark names a commit. Only one machine has git, so the sha is read from this
+# one and the other is taken on faith — and `_health` asks whether the peer is
+# *answering*, which a host running last week's code does perfectly well. A
+# half-completed deploy therefore records a known-good point that is true of one
+# machine and a lie about the other, and the lie surfaces at the worst hour:
+# rolling "back" to it would move the peer somewhere it has never been.
+#
+# Content rather than a version string, because there is no version string to
+# read — `/health` returns `{ok, time}` — and because content is what actually
+# differs. rsync -a copies bytes, so two hosts in sync agree exactly.
+_DIGEST_SNIPPET = """
+import hashlib, json, pathlib
+root = pathlib.Path(%(repo)r)
+h = hashlib.sha256()
+n = 0
+for rel in %(paths)r:
+    for f in sorted((root / rel).rglob("*")):
+        if not f.is_file() or "__pycache__" in f.parts:
+            continue
+        h.update(str(f.relative_to(root)).encode())
+        h.update(f.read_bytes())
+        n += 1
+print(json.dumps({"digest": h.hexdigest()[:16], "files": n}))
+"""
+
+# `packaging` is deliberately left out: it holds unit templates that are only
+# read when somebody runs an installer, so a difference there says nothing about
+# what is running right now, and including it would refuse marks for a reason
+# that has no effect on service.
+_DIGEST_PATHS = ["src/claude_fleet", "vendor/teamclaude/src", "scripts"]
+
+
+def _hosts_agree() -> Optional[str]:
+    """Are both machines running the same code? Returns a complaint, or None."""
+    seen = {}
+    for host, label in HOSTS:
+        repo = str(REPO) if host is None else PEER_REPO
+        try:
+            seen[label] = _run_python_on(
+                host, _DIGEST_SNIPPET % {"repo": repo, "paths": _DIGEST_PATHS},
+                timeout=120)
+        except Exception as exc:                             # noqa: BLE001
+            return "%s 上算不出指纹：%s" % (label, str(exc)[:120])
+        say("    %-8s %s  %d 个文件" % (label, seen[label]["digest"],
+                                        seen[label]["files"]))
+
+    digests = {v["digest"] for v in seen.values()}
+    if len(digests) > 1:
+        return ("两台机器跑的不是同一份代码。标记声称的是一个 commit，而它只在\n"
+                "     一台上成立——回退到它会把另一台送去它从没到过的地方。\n"
+                "     先 `fleet-rollback to HEAD` 让两边一致。")
+    return None
+
+
+def _doctor_ok(host: Optional[str]) -> Optional[bool]:
+    script = (
+        'import sys,json; sys.path.insert(0,"%%s/src");'
+        'from claude_fleet.doctor import doctor;'
+        'ignore=%r;'
+        'r=doctor();'
+        'print(len([c for c in r["checks"]'
+        ' if not c["ok"] and not c.get("skipped") and c["name"] not in ignore]))'
+    ) % (list(_NOT_ABOUT_THE_VERSION),)
+    try:
+        if host:
+            result = subprocess.run(
+                ["ssh", "-o", "ConnectTimeout=8", host,
+                 'HOME=/home/nature python3 -c %s' % json.dumps(script % PEER_REPO)],
+                capture_output=True, text=True, timeout=120)
+        else:
+            result = subprocess.run(
+                [sys.executable, "-c", script % REPO],
+                capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            return None
+        return int(result.stdout.strip().splitlines()[-1]) == 0
+    except Exception:                                        # noqa: BLE001
+        return None
+
+
+def _health(host: Optional[str]) -> Dict[str, Any]:
+    return {
+        "coordinator": _probe(COORDINATOR_HEALTH, host),
+        "dataplane": _probe(DATAPLANE_READY, host),
+        "doctor_clean": _doctor_ok(host),
+    }
+
+
+def _first_seen(sha: str) -> float:
+    """When this commit was first observed live. Resets when HEAD moves."""
+    now = time.time()
+    try:
+        record = json.loads(SEEN.read_text(encoding="utf-8"))
+        if record.get("sha") == sha:
+            return float(record["at"])
+    except (OSError, ValueError, KeyError):
+        pass
+    SEEN.parent.mkdir(parents=True, exist_ok=True)
+    SEEN.write_text(json.dumps({"sha": sha, "at": now}), encoding="utf-8")
+    return now
+
+
+# A synthetic request that has to get past authentication and into the handler.
+# `/v1/pin/check` is the right one to borrow: it authenticates, reads an account
+# out of SQLite and applies the eligibility rules, and it writes nothing.
+#
+# Counting organic traffic was the first attempt and it cannot work: measured on
+# the peer, two hours produced zero routing decisions — not because anything was
+# broken, but because nobody was using it. "Idle" and "rejecting everything"
+# look identical from the event table, so gating on organic volume would either
+# miss the outage or refuse to ever certify a quiet host. Asking directly
+# removes the ambiguity.
+#
+# The token lives in teamclaude.json under fleetCoordinator.token — the same
+# place the service wrapper reads it from — so each host can probe itself.
+_SERVICE_PROBE = """
+import json, os, sys, urllib.error, urllib.request
+runtime = json.load(open(os.path.expanduser("~/.config/claude-fleet/runtime.json")))
+tc = json.load(open(runtime["teamclaude_config"]))
+token = (tc.get("fleetCoordinator") or {}).get("token")
+oauth = [a for a in tc.get("accounts", []) if a.get("type") == "oauth"]
+account = (oauth[0].get("accountUuid") or oauth[0].get("name")) if oauth else "probe"
+headers = {"Content-Type": "application/json"}
+if token:
+    headers["Authorization"] = "Bearer " + token
+req = urllib.request.Request(
+    "http://127.0.0.1:%d/v1/pin/check" % int(runtime.get("coordinator_port", 17891)),
+    data=json.dumps({"account_id": account}).encode("utf-8"),
+    method="POST", headers=headers)
+try:
+    with urllib.request.urlopen(req, timeout=8) as response:
+        print(json.dumps({"status": response.status}))
+except urllib.error.HTTPError as exc:
+    print(json.dumps({"status": exc.code}))
+except Exception as exc:
+    print(json.dumps({"status": 0, "error": str(exc)[:120]}))
+"""
+
+# 401/403 mean authentication is broken — the exact regression the old soak
+# check could not see. 404 means this coordinator does not have the endpoint,
+# so it is not the version we think it is. 0 means nothing answered. Anything
+# else got past auth and into the handler, which is what is being asked.
+_PROBE_FATAL = {0: "协调器没有应答", 401: "鉴权被拒", 403: "鉴权被拒",
+                404: "协调器上没有这个端点 —— 它不是我们以为的版本"}
+
+# Both directions in one round trip. `route.changed` is emitted per execution
+# registration, so it counts decisions rather than only account switches.
+_SOAK_SNIPPET = """
+import json, os, sys, time
+sys.path.insert(0, %(repo)r + "/src")
+from claude_fleet.db import connect_readonly
+cfg = json.load(open(os.path.expanduser("~/.config/claude-fleet/runtime.json")))
+db = connect_readonly(cfg["db_path"])
+since = time.time() - %(window)f
+counts = {}
+for kind in ("route.slow", "route.changed"):
+    counts[kind] = db.execute(
+        "SELECT count(*) FROM events WHERE kind=? AND at>?", (kind, since)
+    ).fetchone()[0]
+print(json.dumps(counts))
+"""
+
+
+HOSTS = ((None, "本机"), (PEER, PEER))
+
+# Self-contained on purpose: it must NOT import claude_fleet.
+#
+# The first version did, and the peer refused the whole deploy with
+# `ModuleNotFoundError: No module named 'claude_fleet'` — because
+# `claude_fleet.backup` is exactly the code being deployed, and the backup runs
+# before the deploy. A snapshot that only works on hosts already carrying the
+# new code cannot protect the first host to receive it.
+#
+# The guard did its job (nothing moved), which is how this was found rather than
+# discovered later with a half-migrated peer.
+_BACKUP_SNIPPET = """
+import json, os, sqlite3, time
+runtime = json.load(open(os.path.expanduser("~/.config/claude-fleet/runtime.json")))
+db = runtime["db_path"]
+directory = os.path.join(os.path.dirname(db), "backups")
+os.makedirs(directory, exist_ok=True)
+stamp = time.strftime("%%Y%%m%%dT%%H%%M%%S", time.localtime())
+target = os.path.join(directory, "fleet-%%s-pre_rollback.sqlite3" %% stamp)
+serial = 1
+while os.path.exists(target):
+    target = os.path.join(directory,
+                          "fleet-%%s-pre_rollback.%%d.sqlite3" %% (stamp, serial))
+    serial += 1
+partial = target + ".partial"
+if os.path.exists(partial):
+    os.unlink(partial)
+# Not mode=ro: a read-only connection cannot create the -shm a WAL database
+# needs, so it fails on any host whose services are stopped.
+conn = sqlite3.connect(db, timeout=30)
+try:
+    conn.execute("VACUUM INTO ?", (partial,))
+finally:
+    conn.close()
+os.replace(partial, target)
+os.chmod(target, 0o600)
+# Same retention as claude_fleet.backup.KEEP, kept in step by hand because the
+# whole point of this snippet is not importing it.
+snapshots = sorted(
+    (os.path.getmtime(os.path.join(directory, n)), os.path.join(directory, n))
+    for n in os.listdir(directory) if n.endswith(".sqlite3"))
+for _at, path in snapshots[:-10]:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+print(json.dumps({"path": target, "bytes": os.path.getsize(target)}))
+"""
+
+
+def _run_python_on(host: Optional[str], body: str, timeout: int = 60) -> Any:
+    """Run a snippet here or on the peer, and return its parsed JSON line.
+
+    Snippets go to the remote interpreter on STDIN, never as `python3 -c "…"`.
+    A multi-line snippet cannot survive the -c form: json.dumps encodes the
+    newlines as backslash-n, and a remote sh inside double quotes leaves them as
+    two literal characters, so Python receives one line and a syntax error.
+    Measured — the peer silently went from "clean soak" to "cannot read", which
+    was the safe direction only by luck. `fleet-quota-sync` uses this same form.
+    """
+    if host:
+        result = subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=8", host, "HOME=/home/nature python3 -"],
+            input=body, capture_output=True, text=True, timeout=timeout)
+    else:
+        result = subprocess.run([sys.executable, "-c", body],
+                                capture_output=True, text=True, timeout=timeout)
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout).strip()[-160:])
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def _serviceable() -> Optional[str]:
+    """Can each host actually answer an authenticated request right now?
+
+    This is the check whose absence made the whole mechanism untrustworthy. The
+    soak used to ask only "were there slow decisions?", and that question cannot
+    see the failure it most needs to catch: break authentication and every
+    `/v1/route/decide` returns 401, so no routing decision is made, so no
+    `route.slow` row is written, so the soak reads perfectly clean. `/health`
+    takes no credentials either, so liveness agrees. A build that rejected every
+    real request in the fleet would be recorded as the known-good point a future
+    rollback restores to.
+
+    Counting organic traffic instead was the obvious fix and it does not work:
+    measured on the peer, two hours produced zero routing decisions simply
+    because nobody was using it. Idle and rejecting-everything are the same
+    shape in the event table. Asking the coordinator directly is unambiguous,
+    and it works on a host that has been quiet all night.
+    """
+    for host, label in HOSTS:
+        try:
+            result = _run_python_on(host, _SERVICE_PROBE, timeout=30)
+        except Exception as exc:                             # noqa: BLE001
+            return "%s 服务探针跑不起来：%s" % (label, str(exc)[:100])
+
+        status = int(result.get("status") or 0)
+        fatal = _PROBE_FATAL.get(status)
+        say("    %-8s 鉴权请求 → HTTP %s%s" % (
+            label, status or "无应答", "  ✗ %s" % fatal if fatal else "  ✓"))
+        if fatal:
+            detail = result.get("error")
+            return "%s %s%s" % (label, fatal,
+                                "（%s）" % detail if detail else "")
+    return None
+
+
+def _soak_clean(hours: float) -> Optional[str]:
+    """Nothing served badly while this version was live. None if clean.
+
+    Serviceability is `_serviceable`'s job; this one is about quality. The two
+    together are what "known good" has to mean: it answers, and it answers well.
+    """
+    for host, label in HOSTS:
+        repo = str(REPO) if host is None else PEER_REPO
+        try:
+            counts = _run_python_on(
+                host, _SOAK_SNIPPET % {"repo": repo, "window": hours * 3600})
+        except Exception as exc:                             # noqa: BLE001
+            return "%s 浸泡检查失败：%s" % (label, str(exc)[:100])
+
+        served = counts.get("route.changed", 0)
+        slow = counts.get("route.slow", 0)
+        # Reported, never gated on: a quiet host is not a broken one.
+        say("    %-8s 浸泡期内 路由决策 %d 次 · 慢决策 %d 次" % (label, served, slow))
+        if slow:
+            return "%s 在浸泡期内有 %d 次慢决策" % (label, slow)
+    return None
+
+
+def cmd_mark(sha: Optional[str], dry: bool, force: bool = False) -> int:
+    resolved = _git("rev-parse", sha or "HEAD")
+    subject = _git("log", "-1", "--format=%s", resolved)
+
+    # `_first_seen` before `time.time()`, not after. Python evaluates the left
+    # operand first, so the old order read the clock, then recorded "now" for a
+    # commit it had not seen before, and subtracted the later value from the
+    # earlier one — printing `-0.0 小时` for a fresh deploy. Harmless to the
+    # decision, and it reads exactly like a clock skew between the two hosts,
+    # which is a thing somebody would then go and investigate.
+    started = _first_seen(resolved)
+    soaked = (time.time() - started) / 3600
+    say("  这个版本已运行 %.1f 小时（需要 %.1f）" % (soaked, SOAK_HOURS))
+    if soaked < SOAK_HOURS and not force:
+        say("  拒绝标记：浸泡不足。部署当下必然健康——今天几次中断都是部署后几分钟才爆的。",
+            err=True)
+        say("     等够时间再标，或 `--force` 明确越过（那是你的判断，不是它的）。", err=True)
+        return 1
+
+    if not force:
+        # Serviceability first: a host that cannot answer an authenticated
+        # request makes every other measurement meaningless.
+        say("  两机此刻能不能真的应答一次鉴权请求")
+        problem = _serviceable()
+        if problem:
+            say("  拒绝标记：%s" % problem, err=True)
+            return 1
+
+        say("  浸泡期内的服务质量")
+        problem = _soak_clean(min(soaked, SOAK_HOURS))
+        if problem:
+            say("  拒绝标记：%s" % problem, err=True)
+            return 1
+
+        say("  两台跑的是不是同一份代码")
+        problem = _hosts_agree()
+        if problem:
+            say("  拒绝标记：%s" % problem, err=True)
+            return 1
+
+    say("  检查两机是否真的在服务（标记是对运行中舰队的断言，不是对 diff 的）")
+    local = _health(None)
+    peer = _health(PEER)
+    for name, h in (("本机", local), (PEER, peer)):
+        say("    %-8s 协调器=%s 数据面=%s doctor=%s" % (
+            name, "✓" if h["coordinator"] else "✗",
+            "✓" if h["dataplane"] else "✗",
+            {True: "干净", False: "有失败", None: "查不到"}[h["doctor_clean"]]))
+
+    bad = [n for n, h in (("本机", local), (PEER, peer))
+           if not (h["coordinator"] and h["dataplane"] and h["doctor_clean"])]
+    if bad:
+        say("  拒绝标记：%s 未处于健康状态" % "、".join(bad), err=True)
+        return 1
+
+    if dry:
+        say("  （干跑：未写入）")
+        return 0
+    MARKS.parent.mkdir(parents=True, exist_ok=True)
+    with MARKS.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({
+            "sha": resolved, "subject": subject, "at": time.time(),
+        }, ensure_ascii=False) + "\n")
+    say("  已标记 %s  %s" % (resolved[:10], subject[:60]))
+    return 0
+
+
+def _commit_exists(sha: str) -> bool:
+    return subprocess.run(
+        ["git", "-C", str(REPO), "cat-file", "-e", "%s^{commit}" % sha],
+        capture_output=True).returncode == 0
+
+
+def _marks() -> List[Dict[str, Any]]:
+    """Known-good points whose commits are still reachable.
+
+    A mark naming a commit git no longer has is not a rollback target, it is a
+    dead end discovered at the worst moment. Two ways that happens: a rebase or
+    GC drops the object, or a test writes to the real file — the production list
+    on this machine carried `abc123 / subject` from a test run, which `list`
+    displayed alongside genuine entries with nothing to tell them apart.
+
+    Filtered rather than deleted: the file is an append-only record, and a
+    commit can also become unreachable temporarily (a branch not yet fetched).
+    """
+    if not MARKS.is_file():
+        return []
+    out = []
+    for line in MARKS.read_text(encoding="utf-8").splitlines():
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(entry, dict) and entry.get("sha") and _commit_exists(entry["sha"]):
+            out.append(entry)
+    return list(reversed(out))
+
+
+def cmd_list() -> int:
+    marks = _marks()
+    if not marks:
+        say("  还没有标记过任何已知良好点。健康时跑一次 `fleet-rollback mark`。")
+        return 0
+
+    # One line per version, not per mark. The hourly job re-marks whatever is
+    # live, so a version that has been healthy for six hours filled six lines
+    # with the same sha — and the question this list answers is "which distinct
+    # versions can I go back to", asked by someone who is already having a bad
+    # time. The count is kept because "proved good 6 times over 6 hours" is
+    # worth more than "proved good once".
+    versions: Dict[str, Dict[str, Any]] = {}
+    for mark in marks:
+        entry = versions.setdefault(mark["sha"], {
+            "sha": mark["sha"], "subject": mark.get("subject") or "",
+            "newest": mark["at"], "oldest": mark["at"], "count": 0,
+        })
+        entry["count"] += 1
+        entry["newest"] = max(entry["newest"], mark["at"])
+        entry["oldest"] = min(entry["oldest"], mark["at"])
+
+    head = _git("rev-parse", "HEAD")
+    now = time.time()
+    for entry in sorted(versions.values(), key=lambda e: e["newest"], reverse=True)[:15]:
+        here = " ← 当前" if entry["sha"] == head else ""
+        proved = ("  ×%d 次, 最早 %.0fh前" % (entry["count"],
+                                             (now - entry["oldest"]) / 3600)
+                  if entry["count"] > 1 else "")
+        say("  %s  %5.1fh前  %s%s%s" % (
+            entry["sha"][:10], (now - entry["newest"]) / 3600,
+            entry["subject"][:48], proved, here))
+    return 0
+
+
+def _say_where_the_repo_stands(was_on: str) -> None:
+    """Name the detached state and the way back to where you were."""
+    if _git("rev-parse", "--abbrev-ref", "HEAD") != "HEAD":
+        return
+    say("")
+    say("  仓库现在是游离 HEAD（%s），不在任何分支上。这是回退应有的状态，"
+        "但在这里提交的东西不属于任何分支。" % _git("rev-parse", "--short", "HEAD"))
+    if was_on and was_on != "HEAD":
+        say("  修好之后回去：git -C %s switch %s" % (REPO, was_on))
+    else:
+        say("  回退之前它就已经是游离的，所以这里说不出该回到哪个分支。")
+
+
+def _deploy(sha: str, dry: bool) -> Optional[str]:
+    # Tracked changes only. `git checkout <sha>` does not touch untracked files,
+    # so they cannot be lost — and counting them means a stray scratch file in
+    # the tree refuses an emergency rollback at exactly the hour you need one.
+    # Measured: two planning documents blocked `to HEAD` outright.
+    dirty = _git("status", "--porcelain", "--untracked-files=no")
+    if dirty:
+        return ("工作区有未提交改动，拒绝执行——你正在做的东西正是会被覆盖的那个。\n"
+                "     先 `git stash` 或提交：\n       " + dirty[:300])
+
+    if dry:
+        say("  （干跑）将执行：")
+        say("     git checkout %s" % sha[:10])
+        for path in DEPLOYED:
+            say("     rsync %s → %s:%s/%s" % (path, PEER, PEER_REPO, path))
+        say("     重启两机协调器与数据面，然后探活")
+        return None
+
+    # Before anything moves. The docstring has always said this tool cannot undo
+    # a schema written by a newer version — that stays true, and a snapshot is
+    # what makes it survivable rather than terminal. Costs 0.1s and ~59 MB
+    # against the live database; not taking it costs everything exactly once.
+    say("  ⓪ 快照两机的状态数据库")
+    for host, label in HOSTS:
+        repo = str(REPO) if host is None else PEER_REPO
+        try:
+            result = _run_python_on(host, _BACKUP_SNIPPET % {"repo": repo},
+                                    timeout=120)
+        except Exception as exc:                             # noqa: BLE001
+            return ("%s 备份失败：%s\n"
+                    "     没有备份就不动数据库这一侧的东西。" % (label, str(exc)[:120]))
+        say("     ✓ %-8s %s (%.1f MB)" % (
+            label, Path(result["path"]).name, result["bytes"] / 1e6))
+
+    # Where we were, so the message at the end can name it. `git checkout <sha>`
+    # detaches HEAD, and until now nothing said so. Detaching is correct — a
+    # rollback deliberately puts the tree somewhere that is not the branch tip.
+    # Being silent about it is not: a commit made while detached belongs to no
+    # branch and is one checkout away from unreachable, and the person most
+    # likely to make one is whoever is at the keyboard right after an outage.
+    was_on = _git("rev-parse", "--abbrev-ref", "HEAD")
+
+    say("  ① 本机 checkout %s" % sha[:10])
+    _git("checkout", "--quiet", sha)
+
+    say("  ② 同步到 %s（逐条校验路径，不靠一条命令带多个源）" % PEER)
+    for path in DEPLOYED:
+        src = REPO / path
+        # 目标是父目录，且源带尾斜杠 —— 这条我今天弄错过一次，把文件丢进了仓库根目录
+        dest = "%s:%s/%s/" % (PEER, PEER_REPO, str(Path(path).parent))
+        result = subprocess.run(
+            ["rsync", "-a", "--delete", "--no-perms", "--no-owner", "--no-group",
+             str(src) + "/", "%s:%s/%s/" % (PEER, PEER_REPO, path)],
+            capture_output=True, text=True, timeout=300)
+        if result.returncode != 0:
+            return "同步 %s 失败：%s" % (path, result.stderr.strip()[-200:])
+        say("     ✓ %s" % path)
+
+    say("  ③ 重启服务")
+    # Every one of these used to be fire-and-forget, and the probe below was the
+    # only thing standing behind them. That is not enough: a restart that fails
+    # (sudo wants a password, the unit is masked, launchd rejects the job) leaves
+    # the OLD process still holding the port, and `_probe` counts any HTTP answer
+    # as alive. The rollback would then report "两机均有响应" and exit 0 while the
+    # peer was still running the code you were rolling away from — the worst
+    # possible outcome, because you would believe you had recovered.
+    restarts = [
+        ("本机协调器", ["launchctl", "kickstart", "-k",
+                        "gui/%d/com.claude-fleet.coordinator" % os.getuid()], 60),
+        ("本机数据面", ["launchctl", "kickstart", "-k",
+                        "gui/%d/com.claude-fleet.dataplane" % os.getuid()], 60),
+        ("%s 两个服务" % PEER,
+         ["ssh", PEER, "sudo systemctl restart claude-fleet-coordinator "
+                       "claude-fleet-dataplane"], 120),
+    ]
+    for label, command, timeout in restarts:
+        try:
+            result = subprocess.run(command, capture_output=True, text=True,
+                                    timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return ("重启 %s 超时（%ds）。旧进程可能仍在监听，探活会误判为成功，"
+                    "所以这里停下。" % (label, timeout))
+        if result.returncode != 0:
+            return ("重启 %s 失败（退出码 %d）：%s\n"
+                    "     旧进程可能仍在监听同一个端口——探活分辨不出来，"
+                    "所以这里停下而不是往下走。"
+                    % (label, result.returncode,
+                       (result.stderr or result.stdout).strip()[-200:]))
+        say("     ✓ %s" % label)
+
+    say("  ④ 探活（最多等 60 秒）")
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        local = _health(None)
+        peer = _health(PEER)
+        if all([local["coordinator"], local["dataplane"],
+                peer["coordinator"], peer["dataplane"]]):
+            say("     两机协调器与数据面均有响应")
+            _say_where_the_repo_stands(was_on)
+            return None
+        time.sleep(3)
+    return ("回退后 60 秒内两机未全部响应。代码已经是 %s；"
+            "服务可手动重启：\n"
+            "       launchctl kickstart -k gui/%d/com.claude-fleet.dataplane\n"
+            "       ssh %s sudo systemctl restart claude-fleet-dataplane"
+            % (sha[:10], os.getuid(), PEER))
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        description="restore a version that was known to work")
+    parser.add_argument("action", choices=["list", "now", "to", "mark"])
+    parser.add_argument("ref", nargs="?")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--force", action="store_true",
+                        help="mark without the soak; your call, not its")
+    args = parser.parse_args(argv)
+
+    if args.action == "list":
+        return cmd_list()
+    if args.action == "mark":
+        return cmd_mark(args.ref, args.dry_run, args.force)
+
+    if args.action == "now":
+        marks = _marks()
+        if not marks:
+            say("  没有已知良好点可回退。用 `fleet-rollback to <sha>` 指定，"
+                "或先在健康时 `mark` 一次。", err=True)
+            return 2
+        target = marks[0]["sha"]
+        say("  目标：%s  %s" % (target[:10], marks[0]["subject"][:60]))
+    else:
+        if not args.ref:
+            say("  需要一个 commit", err=True)
+            return 2
+        target = _git("rev-parse", args.ref)
+        say("  目标：%s" % target[:10])
+
+    failure = _deploy(target, args.dry_run)
+    if failure:
+        say("  %s" % failure, err=True)
+        return 1
+    if not args.dry_run:
+        say("  完成。数据库未被触碰——回退代码是安全的，回退状态不是。")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

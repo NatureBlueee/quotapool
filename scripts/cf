@@ -1,0 +1,84 @@
+#!/bin/sh
+# cf — start Claude on Fable, through Fleet.
+#
+# What blocks Fable is a GrowthBook feature flag cached in ~/.claude.json:
+#
+#   tengu_saffron_lattice = {"enabled": true, "planLimitsEndDate": "2026-07-20…"}
+#
+# With it enabled the client decides Fable runs on usage credits and shows
+# "You don't have usage credits yet". Note that plan-limits date had already
+# expired by eleven days. Nearby sit tengu_saffron_credits_only_tiers =
+# ["enterprise"] and tengu_usage_overage_included_models = ["Fable", "Fable 5"].
+# It is not account permissions.
+#
+# Repairing it once is NOT enough, which is why Fable died again after two or
+# three messages. The client re-fetches GrowthBook DURING a session and
+# overwrites the flag. Measured here: the flag was rewritten to true 23 seconds
+# after being repaired, with cachedGrowthBookFeaturesAt 1.6 minutes old.
+#
+# The server does not suffer this, and the reason is instructive:
+#
+#   host    cachedGrowthBookFeaturesAt   flag
+#   Mac     1.6 minutes ago              overwritten to true
+#   server  150 hours ago                stays false
+#
+# The server carries CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1, so it never
+# fetches GrowthBook at all and the repair sticks. That variable also disables
+# the auto-updater — which is exactly how the server once got pinned to an old
+# build — so it is set HERE, for Fable sessions only, rather than globally in
+# settings.json. Ordinary `claude` keeps updating normally.
+#
+#   cf                       interactive
+#   cf -p 'summarise this'   one-shot
+#   cf --resume              resume on Fable
+#
+# Override the model with FABLE_MODEL if the id changes.
+
+set -eu
+
+MODEL=${FABLE_MODEL:-claude-fable-5[1m]}
+
+# Stop the client re-fetching GrowthBook mid-session, which is what undoes the
+# repair below. Scoped to this process tree only.
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+# Keep the rest of the telemetry surface off too, matching the server's gateway.
+export DISABLE_FEEDBACK_COMMAND=1
+export DISABLE_ERROR_REPORTING=1
+export DISABLE_TELEMETRY=1
+
+if [ "${CF_SKIP_ENTITLEMENT_GUARD:-0}" != "1" ] && [ -f "$HOME/.claude.json" ]; then
+  python3 - "$HOME/.claude.json" <<'PY' || true
+import fcntl, json, os, stat, sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+lock_path = path.with_name(path.name + ".harness-entitlement.lock")
+try:
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        os.chmod(lock_path, 0o600)
+        # Claude Code writes this file constantly; without the lock a
+        # concurrent write can lose the repair or truncate the file.
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        value = json.loads(path.read_text(encoding="utf-8"))
+        features = value.setdefault("cachedGrowthBookFeatures", {})
+        expected = {"enabled": False}
+        if features.get("tengu_saffron_lattice") != expected:
+            features["tengu_saffron_lattice"] = expected
+            tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+            mode = stat.S_IMODE(path.stat().st_mode)
+            with tmp.open("w", encoding="utf-8") as handle:
+                json.dump(value, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(tmp, mode)
+            os.replace(tmp, path)
+except (OSError, json.JSONDecodeError) as error:
+    # Never block a launch over this — worst case the prompt reappears.
+    print(f"cf: could not repair the entitlement flag: {error}", file=sys.stderr)
+PY
+fi
+
+# Through the Fleet shim, never the real binary: that is what keeps account
+# rotation, quota accounting and the shared-account floor in play.
+exec claude --model "$MODEL" "$@"

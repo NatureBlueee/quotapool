@@ -1,0 +1,66 @@
+# Runs the same gate the maintainer runs, on machines that are not the
+# maintainer's. Until this existed, every test run in this project's life had
+# happened on one laptop.
+#
+# No secrets, and that is a property of the test suite rather than a choice
+# here: nothing under `tests/` talks to a live service, and the fixtures that
+# look like credentials are deliberately invalid (see THREAT-MODEL.md, "Things
+# that look like findings and are not").
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both, because the two halves of the reference deployment are a macOS
+        # laptop and a Linux server, and the installers are per-platform:
+        # launchd on one, systemd on the other.
+        os: [ubuntu-latest, macos-latest]
+        # The floor and something current. 3.9 is the floor because that is
+        # what macOS ships and what the services actually run under.
+        python: ['3.9', '3.13']
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.os }} · py${{ matrix.python }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install
+        run: pip install -e '.[dev]'
+
+      - name: Release gate
+        # --release makes a missing dependency fail rather than SKIP. Without
+        # it the gate once printed "all checks passed" on a machine where node
+        # was not installed and the JavaScript checks had silently skipped.
+        run: ./scripts/release-gate.sh --release
+
+      - name: Python tests
+        run: python3 -m pytest tests/ -q
+
+      - name: Data plane tests
+        working-directory: vendor/teamclaude
+        run: node --test
+
+      - name: Publishable tree is clean
+        # The allow-list plus a scan for credentials, addresses and internal
+        # hostnames. It has caught a real leak; it belongs in CI, not in
+        # somebody's memory of what to check before a release.
+        run: python3 -m pytest tests/test_release_hygiene.py -q

@@ -1,0 +1,1032 @@
+#!/usr/bin/env python3
+"""Is the fleet actually working?
+
+Written after finding the Harness server in this state: `fleet doctor` reported
+`ok: true, ready_for_canary: true`, while over the previous 24 hours it had
+routed 17 requests and parked 684, had not switched accounts in 12 hours, held
+two accounts at 100% weekly with the third throttled, and was logging
+`holder is required; launch Claude through Fleet` every single second.
+
+Every one of those doctor checks was correct. They inspect configuration. None
+of them asked whether requests were being served.
+
+This asks that. It is the answer to "how do I know it's working?", and it is
+built to be run unattended — as a timer, from a status line, or by hand — so it
+prints a single verdict line first and exits non-zero when the fleet is not
+serving.
+
+  ./fleet-health              # human summary
+  ./fleet-health --json       # machine readable
+  ./fleet-health --quiet      # verdict line only
+
+Exit codes:
+  0  SERVING   — requests are being routed
+  1  DEGRADED  — serving, but something needs attention soon
+  2  STALLED   — not serving; requests are being parked or rejected
+  3  UNKNOWN   — cannot tell (fleet not installed, database unreadable)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import socket
+import os
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# The state database is WAL, and a `mode=ro` connection cannot create the
+# -shm or run WAL recovery — it fails intermittently with "unable to open
+# database file". Measured at 8% of fleet-quota-sync runs and six times in
+# fleet-health, which means this check had blind spots it never reported.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from claude_fleet.db import connect_readonly  # noqa: E402
+from typing import Any, Dict, List, Optional
+
+
+SERVING, DEGRADED, STALLED, UNKNOWN = 0, 1, 2, 3
+VERDICT_NAME = {0: "SERVING", 1: "DEGRADED", 2: "STALLED", 3: "UNKNOWN"}
+
+# A park is normal when the subscriptions really are spent. It is a fault when
+# it dominates. This ratio is what separates the two, and it is the number that
+# would have caught the server: 684 parks against 17 routes.
+PARK_RATIO_STALLED = 3.0
+PARK_RATIO_DEGRADED = 0.5
+# Requests rejected before any account is chosen. Any sustained rate here means
+# a client is not going through Fleet at all, so no amount of quota will help.
+REJECT_RATE_STALLED = 1.0     # per minute
+# Quota below this on every account is a genuine wait, not a fault.
+SPENT_THRESHOLD = 0.98
+# What actually costs a routing decision is the SIX-HOUR window it reads inside
+# the write transaction, not the size of the table.
+#
+# Measured here: 216,323 events total, of which 1,982 fall in the six-hour
+# window, and that query returns in 0.0 ms — the `at` index does its job. The
+# old check fired on the total, so it reported a problem whose stated harm
+# ("this lengthens every routing decision") was not happening, on a machine
+# doing 4,743 routes a day. An alarm that describes a harm it is not measuring
+# trains people to ignore alarms.
+#
+# The total is still worth a note far higher up, where it means retention has
+# genuinely stopped working rather than that the fleet is busy.
+EVENTS_WINDOW_WARN = 50_000        # inside the 6h window
+EVENTS_TOTAL_WARN = 1_000_000
+
+# Sessions held waiting for capacity. Two kinds, and conflating them is the
+# whole point of separating them:
+#
+#   avoidable  — the request excluded healthy accounts along the way and then
+#                waited. It manufactured its own starvation. A FAULT.
+#   the rest   — the fleet genuinely has no quota. Waiting is the correct
+#                behaviour and resumes by itself; NOT a fault, must not page.
+#
+# Reporting one number would make "out of quota" look like an outage and bury
+# real routing bugs inside it.
+# Requests from a Claude that was not launched through Fleet. Every one is
+# refused, and each refusal kills whatever made it. Measured once at 576 a day
+# on a fixed schedule with nobody aware of it, because the error came back
+# labelled as a proxy fault. Any sustained rate means a launcher is bypassing
+# Fleet, and no amount of quota will help.
+# Sessions that register, get routed, and die within a few seconds without the
+# model ever answering. Measured on the server: 6 of 71 verify-step forks in one
+# day, each transcript nine lines long — prompt in, route assigned, interrupted.
+#
+# They were invisible for the same reason every time: the evidence lives in one
+# transcript per fork and nothing aggregated it. Fleet watched every one of them
+# register, take a route and release it seconds later, and said nothing. An 8%
+# failure rate that nobody could see is worse than a loud one.
+# A long-lived process carrying a Fleet identity whose execution is already
+# dead. The launcher injects X-Fleet-Execution-Id at spawn time; anything that
+# outlives that execution — a daemon, a warm spare pool — keeps presenting it
+# for ever.
+#
+# Measured on the server: the `claude --bg` daemon started at 14:28 during the
+# max-b 502 storm and has carried exec-e3cbf43116f34d28 ever since. That
+# execution's writer lease has expired and its parent row no longer exists, yet
+# every background session spawned since inherits both. It is why every fork and
+# subagent there reports workload `hsm:w7` and class `interactive` regardless of
+# what it actually is.
+# The credential probe. It has to SPAWN — an in-process check inherits a live
+# token from whatever is running it and reports green while every new process
+# dies. That is not hypothetical: credentials expired 2026-07-17 and were found
+# 07-29, eleven days of an entirely green-looking system, because a long-lived
+# daemon held the old token in memory. `claude -p` (new process) died the whole
+# time; `claude --bg` (handed to the daemon) worked.
+#
+# Stale counts as failure. A probe that stopped running tells you nothing, and
+# "nothing" is exactly what those eleven days looked like.
+AUTH_PROBE_STALE_HOURS = 3
+
+STALE_IDENTITY_HOURS = 6
+
+STILLBORN_SECONDS = 5
+STILLBORN_DEGRADED = 3             # per hour
+STILLBORN_STALLED = 20
+
+UNFENCED_LAUNCH_DEGRADED = 10       # per hour
+UNFENCED_LAUNCH_STALLED = 100
+
+# Mirrors coordinator.SLOW_DECISION_SECONDS / DATAPLANE_TIMEOUT_SECONDS. Only
+# the coordinator decides what gets written; these are for wording the verdict.
+DATAPLANE_TIMEOUT = 15.0
+SLOW_DECISION_NOTED = DATAPLANE_TIMEOUT / 3
+# Two thirds of the deadline: past this, a little more concurrency crosses it
+# and requests start being held for real.
+SLOW_DECISION_STALLED = DATAPLANE_TIMEOUT * 2 / 3
+# The verdict window. Long enough that a genuine problem cannot slip between
+# two health runs (they are 15 minutes apart), short enough that a fixed
+# problem clears within the hour instead of at the end of the 6h report window.
+SLOW_DECISION_RECENT_SECONDS = 60 * 60
+
+AVOIDABLE_WAIT_DEGRADED = 1
+AVOIDABLE_WAIT_STALLED = 5
+
+
+def _runtime_path() -> Path:
+    return Path(os.environ.get(
+        "FLEET_RUNTIME_CONFIG",
+        str(Path.home() / ".config" / "claude-fleet" / "runtime.json"),
+    )).expanduser()
+
+
+# The host whose DNS answer was poisoned, and the one to measure it against.
+#
+# AliDNS returns 103.252.115.221 and a 2001::/32 Teredo address for
+# platform.claude.com on the server — neither accepts a connection. It does NOT
+# poison api.anthropic.com, so the fleet served requests normally while every
+# new Claude process that touched the other host died with ERR_SOCKET_CLOSED,
+# which reads as a Claude fault and is a DNS one.
+#
+# The workaround is an /etc/hosts entry. Pinning an address is a debt: it is
+# right until Anthropic moves. What makes it checkable is that both names
+# resolve to the SAME address, and only one of them is poisoned — so the
+# unpoisoned one is a live reference for whether the pin has gone stale.
+PINNED_HOST = "platform.claude.com"
+PINNED_REFERENCE = "api.anthropic.com"
+
+
+def _resolve_v4(host: str) -> Optional[str]:
+    try:
+        infos = socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM)
+    except OSError:
+        return None
+    return infos[0][4][0] if infos else None
+
+
+def _pinned_host_health() -> Dict[str, Any]:
+    """Only meaningful where the pin exists; silent everywhere else."""
+    try:
+        hosts_text = Path("/etc/hosts").read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    pinned = None
+    for line in hosts_text.splitlines():
+        stripped = line.split("#", 1)[0].split()
+        if len(stripped) >= 2 and PINNED_HOST in stripped[1:]:
+            pinned = stripped[0]
+            break
+    if pinned is None:
+        return {}
+
+    reference = _resolve_v4(PINNED_REFERENCE)
+    result: Dict[str, Any] = {
+        "host": PINNED_HOST,
+        "pinned": pinned,
+        "reference": PINNED_REFERENCE,
+        "reference_address": reference,
+    }
+    # Only call it stale when the reference actually answered. A resolver
+    # failure is not evidence the pin is wrong, and reporting it as one would
+    # send someone editing /etc/hosts over a transient DNS blip.
+    if reference and reference != pinned:
+        result["stale"] = True
+        return result
+    try:
+        with socket.create_connection((PINNED_HOST, 443), timeout=4):
+            pass
+    except OSError:
+        result["unreachable"] = True
+    return result
+
+
+def _dataplane_waiting(runtime: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Ask the data plane who is waiting.
+
+    No proxy: this is loopback, and inheriting HTTPS_PROXY would route the
+    health probe through the thing being probed. Failure returns {} rather than
+    raising — an unreachable data plane is already reported by other checks, and
+    this one should not be the thing that crashes the health command.
+    """
+    port = int((runtime or {}).get("proxy_port") or 13456)
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(
+            f"http://127.0.0.1:{port}/teamclaude/status", timeout=4
+        ) as response:
+            return json.loads(response.read().decode("utf-8")).get("waiting") or {}
+    except Exception:
+        return {}
+
+
+def _load_runtime() -> Optional[Dict[str, Any]]:
+    try:
+        value = json.loads(_runtime_path().read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _age(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "never"
+    if seconds < 90:
+        return "%ds" % int(seconds)
+    if seconds < 5400:
+        return "%dm" % (seconds / 60)
+    if seconds < 48 * 3600:
+        return "%.1fh" % (seconds / 3600)
+    return "%.1fd" % (seconds / 86400)
+
+
+def _dataplane_status(runtime: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Live account view straight from the data plane.
+
+    This is the only source that reflects what the process actually believes,
+    as opposed to what was last persisted. On the server the database said one
+    account was `throttled` while the data plane is the component that decides.
+    """
+    port = int(runtime.get("proxy_port", 3456))
+    try:
+        import urllib.request
+
+        # Explicitly no proxy: this is loopback, and inheriting HTTPS_PROXY
+        # here would route the health check through the thing being checked.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(
+            "http://127.0.0.1:%d/teamclaude/status" % port, timeout=5
+        ) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _recent_rejects(window_seconds: int = 3600) -> Optional[int]:
+    """Count `holder is required` rejections in the journal.
+
+    That message means a client reached the data plane without Fleet's launch
+    identity, so the coordinator refused before choosing an account. It is
+    invisible in the database — no execution row, no park event — and it was
+    the actual failure on the server: nine processes hammering a data plane
+    that could not serve any of them.
+
+    The window is an HOUR, not five minutes. This failure arrives in bursts —
+    measured at 12 rejections twice an hour, 576 a day — and a five-minute
+    sample lands on a burst roughly one time in thirty. Averaged into a
+    per-minute rate it came to 0.4 against a threshold of 1.0, so the check
+    that was written for exactly this fault never once fired on it.
+    """
+    command = ["journalctl", "-u", "claude-fleet-dataplane.service",
+               "--since", "-%ds" % window_seconds, "--no-pager", "-q"]
+    if Path("/run/systemd/system").exists():
+        try:
+            result = subprocess.run(
+                command, capture_output=True, text=True, timeout=20
+            )
+            if result.returncode == 0:
+                return result.stdout.count("holder is required")
+        except (OSError, subprocess.SubprocessError):
+            pass
+        # journalctl refuses without privilege for another unit's logs. Say so
+        # rather than reporting zero: this check found the server's actual
+        # fault, and silently reading it as "no rejections" would turn the one
+        # signal that mattered into a clean bill of health.
+        return -1
+
+    # File-based logs (macOS LaunchAgents, or systemd units routed through
+    # `fleet log-sink`). Only count lines inside the window when they are
+    # timestamped; an untimestamped tail measures position in a file, not
+    # recency, and would report a resolved incident as a live one.
+    runtime = _load_runtime() or {}
+    db_path = str(runtime.get("db_path") or "")
+    if not db_path:
+        return None
+    log = Path(db_path).parent / "dataplane.error.log"
+    if not log.is_file():
+        return None
+    try:
+        size = log.stat().st_size
+        with log.open("rb") as handle:
+            if size > 256 * 1024:
+                handle.seek(size - 256 * 1024)
+            text = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+    import re
+
+    stamped = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})")
+    lines = text.splitlines()
+    if not any(stamped.match(line) for line in lines):
+        return None
+    cutoff = time.time() - window_seconds
+    hits = 0
+    for line in lines:
+        match = stamped.match(line)
+        if not match or "holder is required" not in line:
+            continue
+        try:
+            when = time.mktime((
+                int(match.group(1)), int(match.group(2)), int(match.group(3)),
+                int(match.group(4)), int(match.group(5)), int(match.group(6)),
+                0, 0, -1,
+            ))
+        except (ValueError, OverflowError):
+            continue
+        if when >= cutoff:
+            hits += 1
+    return hits
+
+
+def collect(window_hours: float = 24.0) -> Dict[str, Any]:
+    now = time.time()
+    report: Dict[str, Any] = {
+        "at": now,
+        "window_hours": window_hours,
+        "notes": [],
+        "problems": [],
+    }
+
+    runtime = _load_runtime()
+    if runtime is None:
+        report["verdict"] = UNKNOWN
+        report["problems"].append({
+            "problem": "no runtime config at %s" % _runtime_path(),
+            "action": "is Fleet installed for this user?",
+        })
+        return report
+
+    db_path = str(runtime.get("db_path") or "")
+    if not db_path or not Path(db_path).exists():
+        report["verdict"] = UNKNOWN
+        report["problems"].append({
+            "problem": "state database missing: %s" % db_path,
+            "action": "is the coordinator running?",
+        })
+        return report
+
+    try:
+        conn = connect_readonly(db_path, timeout=5)
+        conn.row_factory = sqlite3.Row
+    except sqlite3.Error as exc:
+        report["verdict"] = UNKNOWN
+        report["problems"].append({
+            "problem": "cannot open state database: %s" % exc,
+            "action": "check permissions; this must run as the Fleet user",
+        })
+        return report
+
+    try:
+        since = now - window_hours * 3600
+
+        def count(kind: str) -> int:
+            return conn.execute(
+                "SELECT count(*) FROM events WHERE kind=? AND at>?",
+                (kind, since),
+            ).fetchone()[0]
+
+        routed = count("route.changed")
+        parked = count("execution.parked")
+        leases = conn.execute(
+            "SELECT count(*) FROM route_leases WHERE created_at>?", (since,)
+        ).fetchone()[0]
+        last_route = conn.execute(
+            "SELECT max(at) FROM events WHERE kind='route.changed'"
+        ).fetchone()[0]
+
+        report["serving"] = {
+            "routes_in_window": routed,
+            "route_leases_in_window": leases,
+            "parks_in_window": parked,
+            "last_route": _age(now - last_route if last_route else None) + " ago"
+                          if last_route else "never",
+            "park_ratio": round(parked / routed, 1) if routed else None,
+        }
+
+        accounts: List[Dict[str, Any]] = []
+        live = _dataplane_status(runtime)
+        live_by_name = {}
+        if live:
+            for item in live.get("accounts", []):
+                live_by_name[item.get("name")] = item
+
+        for row in conn.execute("SELECT * FROM accounts ORDER BY id"):
+            metadata = json.loads(row["metadata"] or "{}")
+            name = metadata.get("runtime_name") or row["id"]
+            weekly = row["weekly_used"]
+            floor = row["weekly_floor"] or 0
+            remaining = None if weekly is None else round(1 - weekly - floor, 3)
+            entry = {
+                "account": name,
+                "kind": row["kind"],
+                "state": row["state"],
+                "weekly_remaining_after_floor": remaining,
+                "resets_in": _age(
+                    row["weekly_reset_at"] - now if row["weekly_reset_at"] else None
+                ),
+                "runtime_status": metadata.get("runtime_status"),
+                "quota_seen": _age(
+                    now - row["quota_updated_at"] if row["quota_updated_at"] else None
+                ) + " ago" if row["quota_updated_at"] else "never",
+            }
+            observed = live_by_name.get(name)
+            if observed is not None:
+                entry["live_status"] = observed.get("status")
+                entry["live_disabled"] = bool(observed.get("disabled"))
+            accounts.append(entry)
+        report["accounts"] = accounts
+
+        usable = [
+            a for a in accounts
+            if a["state"] == "healthy"
+            and not a.get("live_disabled")
+            and a.get("runtime_status") != "error"
+            and (a["weekly_remaining_after_floor"] is None
+                 or a["weekly_remaining_after_floor"] > 1 - SPENT_THRESHOLD)
+        ]
+        report["usable_accounts"] = len(usable)
+        report["total_accounts"] = len(accounts)
+
+        rejects = _recent_rejects()
+        if rejects == -1:
+            report["rejects_per_minute"] = None
+            report["notes"].append(
+                "cannot read the data plane journal — the 'holder is required' "
+                "check is blind. Run as root or as the Fleet user, or route the "
+                "service through `fleet log-sink`. This check is what catches "
+                "clients bypassing Fleet entirely."
+            )
+        elif rejects is not None:
+            report["rejects_per_hour"] = rejects
+            report["rejects_per_minute"] = round(rejects / 60.0, 2)
+
+        # A session whose whole life — registered, routed, writer released —
+        # fits inside a few seconds. Counted from events because the executions
+        # row does not record how long it lived.
+        # ONLY session-keyed event kinds. `execution.registered` is keyed by
+        # execution id while these three are keyed by session id, so grouping
+        # all four by `subject` matches nothing at all — which is exactly what
+        # the first version of this query did: it returned 0 for a day that
+        # contained six of them. TEST-MATRIX already records this asymmetry as
+        # a defect that once broke a diagnostic; it broke this one too.
+        # Fleet's own probes are excluded. `fleet-probe-auth` spawns `claude -p`,
+        # which legitimately registers, routes, answers and exits in about three
+        # seconds — a short-lived session that is working exactly as intended.
+        # Four of the first six this check reported were its own synthetic
+        # traffic, and a check that counts its own probes as failures is a check
+        # that will be muted within a week.
+        born = conn.execute(
+            """
+            SELECT count(*) FROM (
+                SELECT e.subject AS s, min(e.at) AS a, max(e.at) AS b
+                FROM events e
+                WHERE e.at > ? AND e.kind IN
+                      ('writer.acquired','route.changed','writer.released')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM executions x
+                      WHERE x.session_id = e.subject
+                        AND x.workload_id LIKE 'probe:%'
+                  )
+                GROUP BY e.subject
+                HAVING count(DISTINCT e.kind) = 3 AND (b - a) <= ?
+            )
+            """,
+            (time.time() - 3600, STILLBORN_SECONDS),
+        ).fetchone()[0]
+        report["stillborn_sessions"] = born
+
+        # Processes whose injected execution id names a dead execution.
+        stale = []
+        try:
+            listing = subprocess.run(
+                ["ps", "-eo", "pid,etimes"], capture_output=True, text=True, timeout=10)
+            for line in listing.stdout.splitlines()[1:]:
+                parts = line.split()
+                if len(parts) != 2 or not parts[1].isdigit():
+                    continue
+                pid, age = parts[0], int(parts[1])
+                if age < STALE_IDENTITY_HOURS * 3600:
+                    continue
+                try:
+                    environ = Path("/proc/%s/environ" % pid).read_bytes()
+                except OSError:
+                    continue
+                for item in environ.split(b"\0"):
+                    if not item.startswith(b"FLEET_EXECUTION_ID="):
+                        continue
+                    eid = item.split(b"=", 1)[1].decode("utf-8", "replace")
+                    row = conn.execute(
+                        "SELECT created_at FROM executions WHERE id=?", (eid,)
+                    ).fetchone()
+                    # The harm is an INHERITED identity — a long-lived process
+                    # handing an execution id that is not its own to every child
+                    # it spawns. A process carrying the execution it was
+                    # launched with is normal, however old it gets.
+                    #
+                    # My first version keyed on the writer lease and immediately
+                    # flagged a healthy six-hour session: `writer_expires_at`
+                    # was NULL, which means the writer was RELEASED between
+                    # turns, not that anything expired. Two different states,
+                    # read as one.
+                    #
+                    # An execution created well before its process started can
+                    # only have been inherited. `ps etimes` is seconds of
+                    # process age, so the comparison is against launch time.
+                    # Only flag when the row EXISTS and predates the process.
+                    #
+                    # A missing row was treated as inherited, and that is
+                    # unknowable: retention deletes executions within a day or
+                    # so, including a process's OWN. Measured — the daemon I
+                    # restarted was flagged 41.9h later for carrying
+                    # exec-91dc0a7863264e8e, an execution it was launched with
+                    # and which the sweep had since removed. Left as written the
+                    # check ends up flagging every long-lived process on the
+                    # machine, which is worse than not having it.
+                    #
+                    # Narrowing loses the case where the evidence was swept
+                    # before anyone looked. A missed detection beats a
+                    # permanent false alarm: one costs attribution accuracy,
+                    # the other costs the operator's attention for every check
+                    # in this file.
+                    launched = time.time() - age
+                    created = (row["created_at"] if row else None)
+                    if created is not None and created < launched - 300:
+                        stale.append({"pid": pid, "execution": eid,
+                                      "age_hours": round(age / 3600, 1)})
+                    break
+        except (OSError, subprocess.SubprocessError):
+            pass
+        report["stale_identity_processes"] = stale[:5]
+
+        try:
+            probe_state = json.loads(
+                (Path.home() / ".local" / "state" / "claude-fleet"
+                 / "auth-probe.json").read_text(encoding="utf-8"))
+            probe_state["stale_hours"] = round(
+                (time.time() - float(probe_state.get("at") or 0)) / 3600, 1)
+            # Was anything actually served while the probe was absent?
+            probe_state["routes_since"] = conn.execute(
+                "SELECT count(*) FROM events WHERE kind='route.changed' AND at>?",
+                (float(probe_state.get("at") or 0),),
+            ).fetchone()[0]
+            report["auth_probe"] = probe_state
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            report["auth_probe"] = None
+
+        # Routing decisions that ran long enough for the data plane to be at
+        # risk of giving up on them. The coordinator writes one row per slow
+        # decision and nothing at all otherwise, so a non-zero count here is
+        # already the anomaly — no threshold tuning, no rate to normalise.
+        slow = conn.execute(
+            "SELECT at,payload FROM events WHERE kind='route.slow' AND at>? "
+            "ORDER BY at DESC", (time.time() - 6 * 3600,)
+        ).fetchall()
+        seconds = []
+        for row in slow:
+            try:
+                seconds.append(float(json.loads(row[1])["seconds"]))
+            except (ValueError, KeyError, TypeError):
+                continue
+        # The verdict follows the RECENT window, the report keeps the whole
+        # one. A six-hour count cannot distinguish "happening now" from
+        # "happened this morning and was fixed", and a check that stays red for
+        # six hours after the cause is gone is a check people learn to wait out.
+        recent_cut = time.time() - SLOW_DECISION_RECENT_SECONDS
+        recent = [row for row in slow if row[0] > recent_cut]
+        report["slow_decisions"] = {
+            "count_6h": len(slow),
+            "count_recent": len(recent),
+            "recent_window_minutes": int(SLOW_DECISION_RECENT_SECONDS / 60),
+            "worst_seconds": max(seconds) if seconds else None,
+            "worst_recent_seconds": max(
+                [s for row, s in zip(slow, seconds) if row[0] > recent_cut] or [0]
+            ) or None,
+            "newest_minutes_ago": (
+                round((time.time() - slow[0][0]) / 60, 1) if slow else None),
+        }
+        report["pinned_hosts"] = _pinned_host_health()
+        report["state_size"] = {
+            "events": conn.execute("SELECT count(*) FROM events").fetchone()[0],
+            "events_6h": conn.execute(
+                "SELECT count(*) FROM events WHERE at>?", (time.time() - 6 * 3600,)
+            ).fetchone()[0],
+            "executions_active": conn.execute(
+                "SELECT count(*) FROM executions WHERE status='active'"
+            ).fetchone()[0],
+        }
+    finally:
+        conn.close()
+
+    # Held sessions, straight from the data plane. Read here rather than derived
+    # from events: a hold is a live connection, not something the control plane
+    # records, so the events table cannot see it at all.
+    report["waiting"] = _dataplane_waiting(runtime)
+
+    _judge(report)
+    return report
+
+
+def _judge(report: Dict[str, Any]) -> None:
+    """Turn measurements into one verdict and concrete actions."""
+    problems = report["problems"]
+    notes = report["notes"]
+    serving = report.get("serving", {})
+    routed = serving.get("routes_in_window", 0)
+    parked = serving.get("parks_in_window", 0)
+    usable = report.get("usable_accounts", 0)
+    verdict = SERVING
+
+    rejects = report.get("rejects_per_minute")
+    if rejects is not None and rejects >= REJECT_RATE_STALLED:
+        verdict = STALLED
+        problems.append({
+            "problem": "%.1f requests/min rejected with 'holder is required'"
+                       % rejects,
+            "means": "clients are reaching the data plane WITHOUT going through "
+                     "Fleet, so no account is ever chosen for them",
+            "action": "launch through `fleet run` / the PATH shim, or check that "
+                      "processWrapper is installed. More quota will not help.",
+        })
+
+    if usable == 0 and report.get("total_accounts", 0) > 0:
+        # Genuinely out of quota is a wait, not a fault — but it still means
+        # nothing can run, so the operator has to know.
+        verdict = max(verdict, STALLED)
+        soonest = min(
+            (a["resets_in"] for a in report["accounts"]
+             if a["resets_in"] != "never"),
+            default="unknown",
+        )
+        problems.append({
+            "problem": "no account can serve right now",
+            "means": "every account is spent, disabled, or needs re-login",
+            "action": "wait for the soonest reset (%s), or add capacity" % soonest,
+        })
+
+    if routed == 0 and parked > 0:
+        verdict = max(verdict, STALLED)
+        problems.append({
+            "problem": "%d parks and zero successful routes in the window" % parked,
+            "means": "the fleet has not served a single request",
+            "action": "run `fleet why <session>` on a parked session",
+        })
+    elif routed and parked / routed >= PARK_RATIO_STALLED:
+        verdict = max(verdict, STALLED)
+        problems.append({
+            "problem": "%d parks against %d routes (%.1fx)"
+                       % (parked, routed, parked / routed),
+            "means": "most requests are being held rather than served",
+            "action": "run `fleet why <session>`; check whether accounts are "
+                      "genuinely spent or being wrongly excluded",
+        })
+    elif routed and parked / routed >= PARK_RATIO_DEGRADED:
+        verdict = max(verdict, DEGRADED)
+        notes.append("parks are elevated (%d against %d routes)" % (parked, routed))
+
+    for account in report.get("accounts", []):
+        # A DISABLED account with a dead token is a decision, not a fault. Left
+        # ungated this pinned the local fleet at DEGRADED permanently over
+        # primary-current, an account deliberately retired months ago — which is
+        # the failure this module's own docstring warns about: a check that is
+        # always yellow teaches the operator to ignore yellow.
+        if account.get("runtime_status") == "error" and not account.get("live_disabled"):
+            verdict = max(verdict, DEGRADED)
+            problems.append({
+                "problem": "account %s needs re-login" % account["account"],
+                "means": "its refresh token was rejected; it is excluded from "
+                         "scheduling and only you can restore it",
+                "action": "fleet login %s  (or disable it if it is retired)"
+                          % account["account"],
+            })
+        elif account.get("runtime_status") == "error":
+            notes.append(
+                "%s is disabled with a dead token — retired, not a fault"
+                % account["account"]
+            )
+        remaining = account.get("weekly_remaining_after_floor")
+        if account["kind"] == "shared" and remaining is not None and remaining <= 0:
+            notes.append(
+                "shared account %s is past its reserve floor — check `fleet why` "
+                "to see whether Fleet ever routed there" % account["account"]
+            )
+
+    auth = report.get("auth_probe")
+    if auth is None:
+        notes.append("认证探针从未跑过 —— `fleet-probe-auth` 没有装定时器")
+    elif (auth.get("stale_hours") is not None
+          and auth["stale_hours"] > AUTH_PROBE_STALE_HOURS
+          and auth.get("routes_since", 0) > 0):
+        # Stale only matters if work was happening that the probe should have
+        # been vouching for. A laptop asleep for four hours does not run
+        # StartInterval jobs and does not route anything either, so the gap
+        # covers nothing — flagging it is noise, and this check has already
+        # cried wolf on my own probes once.
+        verdict = max(verdict, DEGRADED)
+        problems.append({
+            "problem": "认证探针 %.1f 小时没跑，期间有 %d 次路由"
+                       % (auth["stale_hours"], auth["routes_since"]),
+            "means": "credential expiry produces no error of its own; work was "
+                     "being served that nothing was validating",
+            "action": "check the fleet-probe-auth timer",
+        })
+    elif not auth.get("ok"):
+        broken = [name for name in ("bare", "fleet")
+                  if not (auth.get(name) or {}).get("ok")]
+        kinds = {(auth.get(name) or {}).get("reason") for name in broken}
+        if "auth" in kinds:
+            # The condition this probe exists for: credentials expired
+            # 2026-07-17 and went unnoticed for eleven days because a daemon
+            # held the old token in memory.
+            verdict = max(verdict, STALLED)
+            problems.append({
+                "problem": "a new process cannot authenticate on: %s"
+                           % ", ".join(broken),
+                "means": "already-running processes keep working on cached "
+                         "tokens, so everything looks fine while every new "
+                         "session dies",
+                "action": "re-login; `fleet-probe-auth` prints the exact error",
+            })
+        elif kinds == {"timeout"}:
+            # A timeout is not an auth failure, and calling it one is how a
+            # real one gets ignored. Measured: the hourly probe timed out on
+            # both paths at load average 107 across ten cores, while a manual
+            # run minutes earlier — at load 30 — passed in 31s and 24.8s. The
+            # credentials were never in question.
+            #
+            # Reported, not muted: a probe that cannot finish is a probe that
+            # is not watching, and that is worth saying. It just is not the
+            # emergency the word "authenticate" implies.
+            verdict = max(verdict, DEGRADED)
+            problems.append({
+                "problem": "认证探针在 %s 上超时（未完成，不是认证失败）"
+                           % ", ".join(broken),
+                "means": "the probe spawns a real Claude process and waits "
+                         "120s; under heavy machine load it cannot finish, so "
+                         "nothing was validated this hour — the credentials "
+                         "are neither proven good nor proven bad",
+                "action": "check the machine's load average; rerun "
+                          "`fleet-probe-auth` when it is quieter",
+            })
+        else:
+            verdict = max(verdict, DEGRADED)
+            problems.append({
+                "problem": "认证探针在 %s 上失败：%s"
+                           % (", ".join(broken),
+                              ", ".join(sorted(k for k in kinds if k))),
+                "means": "a new process could not complete one trivial "
+                         "exchange, for a reason that is not a timeout and not "
+                         "a rejected credential",
+                "action": "`fleet-probe-auth` prints the exact error",
+            })
+
+    for entry in report.get("stale_identity_processes") or []:
+        verdict = max(verdict, DEGRADED)
+        problems.append({
+            "problem": "pid %s has carried an INHERITED execution id (%s) for "
+                       "%.1fh" % (entry["pid"], entry["execution"],
+                                  entry["age_hours"]),
+            "means": "every session it spawns inherits a dead identity, so "
+                     "workload and class attribution are wrong for all of them",
+            "action": "restart that process when its in-flight work allows — "
+                      "it will pick up a live identity",
+        })
+
+    born = report.get("stillborn_sessions")
+    if born is not None and born >= STILLBORN_STALLED:
+        verdict = max(verdict, STALLED)
+        problems.append({
+            "problem": "%d sessions routed then died within %ds" % (born, STILLBORN_SECONDS),
+            "means": "work is being started and lost before the model answers",
+            "action": "read one of their transcripts under ~/.claude/projects — "
+                      "Fleet routed them, so the cause is on the launcher side",
+        })
+    elif born is not None and born >= STILLBORN_DEGRADED:
+        verdict = max(verdict, DEGRADED)
+        problems.append({
+            "problem": "%d short-lived sessions in the last hour" % born,
+            "means": "forks or subagents dying seconds after being routed",
+            "action": "fleet why <session>, then read that session's transcript",
+        })
+
+    per_hour = report.get("rejects_per_hour")
+    if per_hour is not None and per_hour >= UNFENCED_LAUNCH_STALLED:
+        verdict = max(verdict, STALLED)
+        problems.append({
+            "problem": "%d requests/hour from a Claude not launched through Fleet"
+                       % per_hour,
+            "means": "every one is refused and kills whatever made it; quota "
+                     "cannot help",
+            "action": "find the launcher that bypasses Fleet — `fleet run`, or "
+                      "inherit the launcher environment",
+        })
+    elif per_hour is not None and per_hour >= UNFENCED_LAUNCH_DEGRADED:
+        verdict = max(verdict, DEGRADED)
+        problems.append({
+            "problem": "%d requests/hour bypassing Fleet's launcher" % per_hour,
+            "means": "each is refused; something is starting Claude directly",
+            "action": "check what runs on that schedule",
+        })
+
+    # Judged BEFORE the waiting block, and it matters that it is.
+    #
+    # A held request reads as "the fleet waiting, not failing" — correct when a
+    # quota window is empty, and exactly wrong when the control plane is too
+    # slow to answer. Both arrive as a held request. Without this check the
+    # second hides inside the first, which is how a 19-second routing decision
+    # stayed invisible while the data plane logged "coordinator unreachable"
+    # every few minutes and the user felt it as sessions hanging.
+    pin = report.get("pinned_hosts") or {}
+    if pin.get("stale"):
+        verdict = max(verdict, DEGRADED)
+        problems.append({
+            "problem": "/etc/hosts pins %s to %s, but %s now resolves to %s"
+                       % (pin["host"], pin["pinned"], pin["reference"],
+                          pin["reference_address"]),
+            "means": "the pin was added to work around a poisoned DNS answer "
+                     "and has outlived the address it pinned; new Claude "
+                     "processes touching that host will fail to connect",
+            "action": "update the entry in /etc/hosts to %s"
+                      % pin["reference_address"],
+        })
+    elif pin.get("unreachable"):
+        verdict = max(verdict, DEGRADED)
+        problems.append({
+            "problem": "%s does not accept a connection" % pin["host"],
+            "means": "background agents die within seconds of launch with "
+                     "ERR_SOCKET_CLOSED; the main session keeps working, which "
+                     "is why this looks like a Claude problem and is not",
+            "action": "compare `getent ahosts %s` against `dig +short @8.8.8.8 "
+                      "%s`" % (pin["host"], pin["host"]),
+        })
+
+    slow = report.get("slow_decisions") or {}
+    slow_recent = int(slow.get("count_recent") or 0)
+    slow_total = int(slow.get("count_6h") or 0)
+    if slow_recent:
+        worst = slow.get("worst_recent_seconds")
+        near_timeout = worst is not None and worst >= SLOW_DECISION_STALLED
+        verdict = max(verdict, STALLED if near_timeout else DEGRADED)
+        problems.append({
+            "problem": "%d routing decision(s) took over %gs in the last %dm%s"
+                       % (slow_recent, SLOW_DECISION_NOTED,
+                          slow.get("recent_window_minutes", 60),
+                          "" if worst is None else ", worst %.1fs" % worst),
+            "means": "sessions wait on the control plane, not on quota — the "
+                     "data plane gives up at %gs and holds the request"
+                     % DATAPLANE_TIMEOUT,
+            "action": "fleet events route.slow; the row carries a timing "
+                      "breakdown — queued vs solve vs fast_sticky",
+        })
+    elif slow_total:
+        # Earlier today, not now. Still worth saying — it names a window worth
+        # looking at — but it must not hold the verdict down, or the check
+        # stays red for hours after the cause is gone.
+        notes.append(
+            "%d slow routing decision(s) earlier in the 6h window, none in the "
+            "last %dm%s" % (
+                slow_total, slow.get("recent_window_minutes", 60),
+                "" if slow.get("worst_seconds") is None
+                else " (worst was %.1fs)" % slow["worst_seconds"]))
+
+    wait = report.get("waiting") or {}
+    avoidable = int(wait.get("avoidable") or 0)
+    held = int(wait.get("count") or 0)
+    if avoidable >= AVOIDABLE_WAIT_STALLED:
+        verdict = max(verdict, STALLED)
+        problems.append({
+            "problem": "%d of %d waiting sessions excluded healthy accounts "
+                       "before waiting" % (avoidable, held),
+            "means": "these requests manufactured their own starvation — the "
+                     "fleet had capacity they refused",
+            "action": "fleet why <session> on one of them; check the exclusion "
+                      "reasons in the data plane log",
+        })
+    elif avoidable >= AVOIDABLE_WAIT_DEGRADED:
+        verdict = max(verdict, DEGRADED)
+        problems.append({
+            "problem": "%d waiting session(s) excluded healthy accounts first"
+                       % avoidable,
+            "means": "capacity was available and was passed over",
+            "action": "fleet why <session>",
+        })
+    elif held:
+        # Deliberately a note, never a problem. A held request resumes on its
+        # own when quota returns; that is the designed behaviour, not an outage.
+        soonest = wait.get("soonestRecoverySeconds")
+        notes.append(
+            "%d session(s) waiting for quota%s — this is the fleet waiting, "
+            "not failing" % (
+                held,
+                "" if soonest is None else ", soonest recovery in %dm"
+                % max(1, int(soonest) // 60),
+            )
+        )
+
+    size = report.get("state_size", {})
+    if size.get("events_6h", 0) > EVENTS_WINDOW_WARN:
+        verdict = max(verdict, DEGRADED)
+        problems.append({
+            "problem": "%d events inside the 6h decision window" % size["events_6h"],
+            "means": "route decisions read this window INSIDE the write "
+                     "transaction, so it lengthens every routing decision",
+            "action": "fleet maintenance sweep, and check what is emitting them",
+        })
+    elif size.get("events", 0) > EVENTS_TOTAL_WARN:
+        notes.append(
+            "%d events in total — retention is not keeping up, though the 6h "
+            "decision window is still small (%d)"
+            % (size["events"], size.get("events_6h", 0))
+        )
+
+    report["verdict"] = verdict
+
+
+def render(report: Dict[str, Any], quiet: bool = False) -> str:
+    verdict = report.get("verdict", UNKNOWN)
+    lines = []
+    serving = report.get("serving", {})
+    if verdict == SERVING:
+        headline = "SERVING — %d routes, %d parks in %gh" % (
+            serving.get("routes_in_window", 0),
+            serving.get("parks_in_window", 0),
+            report.get("window_hours", 24),
+        )
+    elif verdict == UNKNOWN:
+        headline = "UNKNOWN — cannot determine fleet state"
+    else:
+        headline = "%s — %s" % (
+            VERDICT_NAME[verdict],
+            report["problems"][0]["problem"] if report.get("problems")
+            else "see details",
+        )
+    lines.append(headline)
+    if quiet:
+        return "\n".join(lines)
+
+    for problem in report.get("problems", []):
+        lines.append("")
+        lines.append("  ! %s" % problem["problem"])
+        if problem.get("means"):
+            lines.append("    means:  %s" % problem["means"])
+        lines.append("    do:     %s" % problem["action"])
+
+    for note in report.get("notes", []):
+        lines.append("")
+        lines.append("  - %s" % note)
+
+    accounts = report.get("accounts", [])
+    if accounts:
+        lines.append("")
+        lines.append("  accounts (%d of %d usable):" % (
+            report.get("usable_accounts", 0), len(accounts)))
+        for account in accounts:
+            remaining = account["weekly_remaining_after_floor"]
+            lines.append(
+                "    %-26s %-7s %-9s weekly_left=%-6s resets_in=%-7s %s" % (
+                    account["account"][:26],
+                    account["kind"],
+                    account.get("live_status") or account["state"],
+                    "?" if remaining is None else "%.2f" % remaining,
+                    account["resets_in"],
+                    "(quota seen %s)" % account["quota_seen"],
+                )
+            )
+
+    if serving:
+        lines.append("")
+        lines.append("  last account switch: %s" % serving.get("last_route"))
+    return "\n".join(lines)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="report whether the fleet is actually serving requests",
+    )
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--quiet", action="store_true",
+                        help="verdict line only")
+    parser.add_argument("--window-hours", type=float, default=24.0)
+    args = parser.parse_args(argv)
+
+    report = collect(window_hours=args.window_hours)
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print(render(report, quiet=args.quiet))
+    return int(report.get("verdict", UNKNOWN))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

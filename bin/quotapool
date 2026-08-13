@@ -1,0 +1,32 @@
+#!/bin/sh
+# The control-plane entry point. Everything else in bin/ execs this.
+#
+# `fleet` beside it is a compatibility alias, kept because a running install has
+# it wired into launchd plists, wrapper scripts and a shell shim. The name also
+# collides with JetBrains Fleet and Rancher Fleet, which is why the command is
+# `quotapool` now.
+#
+# It resolves the checkout from its own location rather than assuming one. The
+# previous version computed `$BIN_DIR/../share/claude-fleet`, which is correct
+# on exactly one machine — the one where the repository happens to live at
+# ~/.local/share/claude-fleet — and silently wrong anywhere else. A clean-machine
+# install found it: nothing in bin/ works without `fleet`, and `fleet` could not
+# find the code it was supposed to run.
+#
+# Pure sh, no interpreter spawned to answer the question. This runs on the path
+# of every `claude` invocation, and paying a Python startup here to compute a
+# path would be paying it forever.
+set -eu
+
+target=$0
+# Follow the symlink chain by hand: `readlink -f` is not portable to macOS.
+while [ -L "$target" ]; do
+  link=$(readlink "$target")
+  case "$link" in
+    /*) target=$link ;;
+    *)  target=$(dirname -- "$target")/$link ;;
+  esac
+done
+
+PREFIX=$(CDPATH= cd -- "$(dirname -- "$target")/.." && pwd)
+PYTHONPATH="$PREFIX/src${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m claude_fleet.cli "$@"

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quotapool"
+version = "0.4.8"
+description = "Pool the Claude subscriptions you own; Claude Code stops noticing which one it is on"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+
+[project.urls]
+Homepage = "https://github.com/NatureBlueee/quotapool"
+Source = "https://github.com/NatureBlueee/quotapool"
+Issues = "https://github.com/NatureBlueee/quotapool/issues"
+
+# There are no runtime dependencies, on purpose — see README. `dev` exists
+# because without it the 486 Python tests are the main evidence that this
+# program works and nobody outside this machine can reach them.
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+quotapool = "claude_fleet.cli:main"
+# The old name, kept because a running install has it wired into launchd
+# plists, wrapper scripts and a shell shim.
+fleet = "claude_fleet.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

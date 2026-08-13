@@ -1,0 +1,20 @@
+#!/bin/sh
+# Compatibility alias for `quotapool`.
+#
+# The command was called `fleet` until the project was named, and a running
+# install has that name wired into launchd plists, the wrapper scripts and the
+# shell shim. Renaming those in place would break a live system for no benefit,
+# so the old name keeps working and forwards.
+#
+# `fleet` was never a good command name anyway: JetBrains Fleet is an IDE and
+# Rancher Fleet is a Kubernetes tool, and both ship a `fleet` binary.
+set -eu
+target=$0
+while [ -L "$target" ]; do
+  link=$(readlink "$target")
+  case "$link" in
+    /*) target=$link ;;
+    *)  target=$(dirname -- "$target")/$link ;;
+  esac
+done
+exec "$(dirname -- "$target")/quotapool" "$@"

@@ -1,0 +1,578 @@
+#!/usr/bin/env python3
+"""One JSON snapshot of both hosts, for the desktop monitor.
+
+Separated from the UI on purpose: the numbers are the hard part and they should
+be inspectable without opening a window. `fleet-snapshot | jq` is a first-class
+way to use this.
+
+    fleet-snapshot            # local only, fast
+    fleet-snapshot --remote   # include the server (adds ~0.5s over tailnet)
+
+Everything here is read-only and takes no writer lock, so it is safe to poll
+while the coordinator is serving.
+"""
+
+from __future__ import annotations
+
+
+def _peer_host() -> str:
+    """The other host, from config rather than a literal.
+
+    It used to be a hardcoded hostname, which is both un-publishable and wrong
+    for anyone else's fleet: they would have to edit source to use their own
+    machine. runtime.json already carries this host's identity; the peer belongs
+    next to it.
+    """
+    if os.environ.get("FLEET_PEER"):
+        return os.environ["FLEET_PEER"]
+    try:
+        import json as _json
+        runtime = _json.loads(
+            (pathlib.Path(os.environ.get(
+                "FLEET_RUNTIME_CONFIG",
+                str(pathlib.Path.home() / ".config" / "claude-fleet" / "runtime.json"))
+            )).read_text(encoding="utf-8"))
+        return str(runtime.get("peer_host") or "")
+    except Exception:                                         # noqa: BLE001
+        return ""
+
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+import pathlib
+from pathlib import Path
+
+# The state database is WAL, and a `mode=ro` connection cannot create the
+# -shm or run WAL recovery — it fails intermittently with "unable to open
+# database file". Measured at 8% of fleet-quota-sync runs and six times in
+# fleet-health, which means this check had blind spots it never reported.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from claude_fleet.db import connect_readonly  # noqa: E402
+from claude_fleet.control import effective_weekly_floor  # noqa: E402
+from typing import Any, Dict, List, Optional
+
+# 会话计数的时间窗。写者租约是 24 小时，光看 status='active' 会把一整天前就
+# 被遗弃的会话算成"正在运行"。半小时是个折中：真正在跑的窗口会持续路由，
+# 而被丢下的不会。这个值随快照一起输出，界面据此标注，不让读的人去猜。
+SESSION_WINDOW = 1800
+
+# How recently an account must have been routed to for the panel to call it
+# "in use". Short on purpose: this answers "what is taking traffic now", and a
+# generous window would make a just-exhausted account look live for minutes
+# after everything moved off it.
+ACTIVE_ACCOUNT_WINDOW = 300
+
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def _runtime() -> Dict[str, Any]:
+    path = Path(os.environ.get(
+        "FLEET_RUNTIME_CONFIG",
+        str(Path.home() / ".config" / "claude-fleet" / "runtime.json"),
+    )).expanduser()
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+TOKEN_STATE = Path.home() / ".local" / "state" / "claude-fleet" / "token-state.json"
+
+
+def _tokens() -> Dict[str, Any]:
+    """Token counts, from the buckets `fleet-tokens --collect` maintains.
+
+    Read only — never a scan. The collector runs on its own timer precisely so
+    that a 20-second panel refresh does not pay for one.
+    """
+    try:
+        state = json.loads(TOKEN_STATE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return _summarise_buckets(state)
+
+
+def _summarise_buckets(state: Dict[str, Any]) -> Dict[str, Any]:
+    buckets = state.get("buckets") or {}
+    daily = state.get("daily") or {}
+    now = time.time()
+
+    def _add(target, store, floor):
+        # Each bucket is {model: [input, output, 5m写, 1h写, 缓存读]}. It used to
+        # be a flat list; iterating it as one after the schema changed raised
+        # KeyError and took the WHOLE snapshot down — which is why the panel
+        # went stale without anyone noticing. Hence `--selftest` below.
+        for key, models in store.items():
+            if int(key) < floor:
+                continue
+            for values in models.values():
+                for i in range(min(len(values), len(target))):
+                    target[i] += values[i]
+
+    def window(seconds):
+        # Both stores: minutes inside the retention line, days beyond it.
+        # Reading only the buckets is how a 30-day number silently becomes a
+        # one-day number.
+        total = [0, 0, 0, 0, 0]
+        _add(total, buckets, (now - seconds) // 60)
+        _add(total, daily, (now - seconds) // 86400)
+        # cache_read is deliberately outside `counted`: it ran 8.1 BILLION
+        # against 43M of output in one day here, so including it would produce
+        # a number describing cache hits rather than consumption.
+        return {"counted": total[0] + total[1] + total[2] + total[3],
+                "output": total[1], "cache_read": total[4]}
+
+    total = [0, 0, 0, 0, 0]
+    for store in (buckets, daily):
+        for models in store.values():
+            for values in models.values():
+                for i in range(min(len(values), 5)):
+                    total[i] += values[i]
+
+    five = window(300)
+    return {
+        "per_minute": round(five["counted"] / 5, 1),
+        "last_hour": window(3600)["counted"],
+        "last_24h": window(24 * 3600)["counted"],
+        "last_30d": window(30 * 86400)["counted"],
+        "total": total[0] + total[1] + total[2] + total[3],
+        "days_recorded": len(daily),
+        "output_24h": window(24 * 3600)["output"],
+        "age_seconds": (round(now - state["updated_at"], 1)
+                        if state.get("updated_at") else None),
+    }
+
+
+def _effective_floor(row) -> float:
+    """One implementation, shared with the scheduler and `fleet capacity`."""
+    return effective_weekly_floor(row)
+
+
+def _open_db(db_path: str) -> Optional[sqlite3.Connection]:
+    if not db_path or not Path(db_path).exists():
+        return None
+    try:
+        conn = connect_readonly(db_path, timeout=3)
+        conn.row_factory = sqlite3.Row
+        return conn
+    except sqlite3.Error:
+        return None
+
+
+def _live_quota(port: int) -> Dict[str, Any]:
+    """The data plane's own view, which is fresher than the database.
+
+    Explicitly no proxy: this is loopback, and inheriting HTTPS_PROXY would
+    route the health probe through the thing being probed.
+    """
+    try:
+        import urllib.request
+
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(f"http://127.0.0.1:{port}/teamclaude/status", timeout=3) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return {}
+
+
+def collect_local() -> Dict[str, Any]:
+    runtime = _runtime()
+    now = time.time()
+    out: Dict[str, Any] = {"host": "mac", "at": now, "accounts": [],
+                           "sessions": [], "running": [], "active_accounts": []}
+
+    out["tokens"] = _tokens()
+    live = _live_quota(int(runtime.get("proxy_port", 13456)))
+    live_by_name = {a.get("name"): a for a in live.get("accounts", [])}
+    out["current_account"] = live.get("currentAccount")
+    out["dataplane_up"] = bool(live)
+    # 等待中的会话。挂起本身是对的（会自己恢复），但必须看得见 ——
+    # 分不清"在等额度"和"卡死了"，正是上次事故拖了几小时的原因。
+    out["waiting"] = live.get("waiting") or {}
+
+    conn = _open_db(str(runtime.get("db_path") or ""))
+    if conn is None:
+        out["error"] = "state database unavailable"
+        return out
+
+    try:
+        for row in conn.execute("SELECT * FROM accounts ORDER BY id"):
+            meta = json.loads(row["metadata"] or "{}")
+            name = meta.get("runtime_name") or row["id"]
+            weekly = row["weekly_used"]
+            floor = row["weekly_floor"] or 0
+            observed = live_by_name.get(name, {}).get("quota") or {}
+            # Prefer the live reading; the database only updates when the
+            # snapshot signature changes.
+            if observed.get("unified7d") is not None:
+                weekly = min(float(observed["unified7d"]), 1.0)
+            out["accounts"].append({
+                "id": row["id"],
+                "name": name,
+                "quota_updated_at": row["quota_updated_at"],
+                "kind": row["kind"],
+                "state": row["state"],
+                "is_uuid": bool(UUID_RE.match(row["id"])),
+                "weekly_used": weekly,
+                # THE FLOOR IN FORCE, not the one on disk. For a shared account
+                # it tapers as the window closes, and every consumer wants the
+                # number the scheduler is actually applying.
+                #
+                # Reporting the stored one made the panel say `hi` was exhausted
+                # at -0.02 while the scheduler, reading +0.11, routed 58 sessions
+                # to it in half an hour. Fixing only `remaining` did not help:
+                # the panel decodes `weekly_floor` and does its own arithmetic,
+                # so it kept showing zero. A display that disagrees with the
+                # decision it describes is worse than no display.
+                "weekly_floor": round(_effective_floor(row), 3),
+                "stored_weekly_floor": floor,
+                "remaining": None if weekly is None else round(
+                    1 - weekly - _effective_floor(row), 3),
+                "weekly_reset_at": row["weekly_reset_at"],
+                "five_hour_used": row["five_hour_used"],
+                "five_hour_reset_at": row["five_hour_reset_at"],
+                "interactive_reserve": row["interactive_reserve"],
+                "live_status": live_by_name.get(name, {}).get("status"),
+                "disabled": bool(live_by_name.get(name, {}).get("disabled")),
+            })
+
+        # Which accounts are actually taking traffic right now.
+        #
+        # NOT `current_account` from the data plane: that is the last account it
+        # happened to touch and it lags badly. Measured while writing this —
+        # both hosts reported `hey`, which was 99% spent, while every routing
+        # decision in the previous five minutes had gone to `hi@` (28 of them,
+        # the most recent four seconds earlier) because its weekly window had
+        # just rolled over. A pointer to the past is not a statement about now.
+        for row in conn.execute(
+            "SELECT account_id, count(*) AS n, max(updated_at) AS seen "
+            "FROM route_leases WHERE updated_at > ? GROUP BY 1 ORDER BY n DESC",
+            (now - ACTIVE_ACCOUNT_WINDOW,),
+        ):
+            out["active_accounts"].append({
+                "account": row["account_id"],
+                "requests": row["n"],
+                "last_seen": row["seen"],
+            })
+
+        # What is running, by shape of work.
+        #
+        # From `execution_nodes`, which the SessionStart/SubagentStart hooks
+        # populate — NOT from executions joined to route leases. The latter
+        # carries account attribution but its `workload_class` comes from a
+        # header the launcher injects at process start, and an in-process
+        # subagent makes its requests with the parent's headers. So every
+        # subagent on the server was being recorded as `interactive`: 275
+        # SubagentStart hooks in 24 hours and not one subagent execution row.
+        #
+        # The node table had it right the whole time — 4 active subagents on the
+        # server in the last half hour, against 1 window.
+        for row in conn.execute(
+            "SELECT node_type AS kind, count(*) AS n FROM execution_nodes "
+            "WHERE status='active' AND updated_at > ? GROUP BY 1 ORDER BY n DESC",
+            (now - SESSION_WINDOW,),
+        ):
+            out["running"].append({"kind": row["kind"], "count": row["n"]})
+
+        # Kept alongside: this one knows which ACCOUNT is carrying the work,
+        # which the node table does not record.
+        #
+        # This used to be `ORDER BY l.updated_at DESC LIMIT 12` and the caller
+        # counted the rows it got back, so every count was silently the LIMIT.
+        # Measured at the time: the Mac reported 12 against 4,387 actual and the
+        # server reported 8 against 36. Those were not counts, they were the
+        # page size.
+        #
+        # And "active" alone is far too generous: the writer lease runs 24h, so
+        # an abandoned session stays active-looking for a day. Of those 4,387
+        # only 7 had been touched within a minute and 97 within half an hour.
+        # So recency is part of the query rather than something the reader is
+        # left to guess at, and the window is reported so the number can be
+        # labelled with what it actually means.
+        for row in conn.execute(
+            "SELECT e.workload_class AS workload, l.account_id AS account, "
+            "       count(*) AS n "
+            "FROM executions e JOIN route_leases l ON l.session_id = e.session_id "
+            "WHERE e.status='active' AND e.writer_expires_at > ? "
+            "  AND l.updated_at > ? "
+            "GROUP BY 1, 2 ORDER BY n DESC",
+            (now, now - SESSION_WINDOW),
+        ):
+            out["sessions"].append({
+                "workload": row["workload"],
+                "account": row["account"],
+                "count": row["n"],
+            })
+        out["session_window_seconds"] = SESSION_WINDOW
+
+        # Is rotation actually happening? A switch is from != to; a first
+        # assignment has from = null and is not a switch.
+        switches: List[Dict[str, Any]] = []
+        for row in conn.execute(
+            "SELECT at, payload FROM events WHERE kind='route.changed' AND at > ? "
+            "ORDER BY seq DESC LIMIT 400",
+            (now - 86400,),
+        ):
+            payload = json.loads(row["payload"])
+            if payload.get("from") and payload.get("to") and payload["from"] != payload["to"]:
+                switches.append({
+                    "at": row["at"],
+                    "from": payload["from"],
+                    "to": payload["to"],
+                    "reason": payload.get("reason"),
+                })
+        out["switches_24h"] = len(switches)
+        out["recent_switches"] = switches[:6]
+
+        out["parks_24h"] = conn.execute(
+            "SELECT count(*) FROM events WHERE kind='execution.parked' AND at > ?",
+            (now - 86400,),
+        ).fetchone()[0]
+        out["routes_24h"] = conn.execute(
+            "SELECT count(*) FROM events WHERE kind='route.changed' AND at > ?",
+            (now - 86400,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    return out
+
+
+REMOTE_SCRIPT = r"""
+import json, sqlite3, time, urllib.request
+now = time.time()
+out = {"host": "server", "at": now, "accounts": [], "sessions": [], "running": [],
+       "active_accounts": []}
+try:
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open("http://127.0.0.1:13456/teamclaude/status", timeout=3) as r:
+        live = json.loads(r.read().decode())
+except Exception:
+    live = {}
+live_by_name = {a.get("name"): a for a in live.get("accounts", [])}
+out["current_account"] = live.get("currentAccount")
+out["dataplane_up"] = bool(live)
+out["waiting"] = live.get("waiting") or {}
+c = sqlite3.connect("file:/home/nature/.local/state/claude-fleet/fleet.sqlite3?mode=ro", uri=True)
+
+# Moved below the connection it uses. This ran BEFORE `c` existed, so the
+# server block died with NameError on every fetch and the panel showed a
+# traceback where 硅谷 should be. Not a new fault — the same ordering is in
+# the previous commit; the cached block was hiding it.
+for row in c.execute(
+    "SELECT account_id, count(*), max(updated_at) FROM route_leases "
+    "WHERE updated_at > ? GROUP BY 1 ORDER BY 2 DESC", (now - 300,)):
+    out["active_accounts"].append({"account": row[0], "requests": row[1], "last_seen": row[2]})
+c.row_factory = sqlite3.Row
+for row in c.execute("SELECT * FROM accounts WHERE length(id)=36 ORDER BY id"):
+    meta = json.loads(row["metadata"] or "{}")
+    name = meta.get("runtime_name") or row["id"]
+    weekly = row["weekly_used"]
+    for a in live.get("accounts", []):
+        q = a.get("quota") or {}
+        if a.get("accountUuid") == row["id"] and q.get("unified7d") is not None:
+            weekly = min(float(q["unified7d"]), 1.0)
+    floor = row["weekly_floor"] or 0
+    out["accounts"].append({
+        "id": row["id"], "name": name, "kind": row["kind"], "state": row["state"],
+        "quota_updated_at": row["quota_updated_at"],
+        "weekly_used": weekly, "weekly_floor": floor,
+        # Raw on purpose. This block runs as `python3 -` on the server with no
+        # package on the path, so it cannot import the taper — and copying it
+        # here would be a second implementation to drift. The merging side
+        # recomputes `remaining` from these two fields.
+        "remaining": None if weekly is None else round(1 - weekly - floor, 3),
+        "weekly_reset_at": row["weekly_reset_at"],
+        "five_hour_used": row["five_hour_used"],
+        "five_hour_reset_at": row["five_hour_reset_at"],
+    })
+try:
+    _st = json.load(open("/home/nature/.local/state/claude-fleet/token-state.json"))
+    _b = _st.get("buckets") or {}
+    _d = _st.get("daily") or {}
+    def _acc(t, store, floor):
+        for k, models in store.items():
+            if int(k) < floor: continue
+            for v in models.values():
+                for i in range(min(len(v), 5)): t[i] += v[i]
+    def _win(sec):
+        t = [0, 0, 0, 0, 0]
+        _acc(t, _b, (now - sec) // 60)
+        _acc(t, _d, (now - sec) // 86400)
+        return {"counted": t[0]+t[1]+t[2]+t[3], "output": t[1], "cache_read": t[4]}
+    _tot = [0, 0, 0, 0, 0]
+    _acc(_tot, _b, -1)
+    _acc(_tot, _d, -1)
+    _f = _win(300)
+    out["tokens"] = {"per_minute": round(_f["counted"]/5, 1),
+                     "last_hour": _win(3600)["counted"],
+                     "last_24h": _win(86400)["counted"],
+                     "last_30d": _win(30*86400)["counted"],
+                     "total": _tot[0]+_tot[1]+_tot[2]+_tot[3],
+                     "days_recorded": len(_d),
+                     "output_24h": _win(86400)["output"],
+                     "age_seconds": (round(now - _st["updated_at"], 1)
+                                     if _st.get("updated_at") else None)}
+except Exception:
+    out["tokens"] = {}
+
+WINDOW = 1800
+for row in c.execute(
+    "SELECT node_type, count(*) FROM execution_nodes "
+    "WHERE status='active' AND updated_at > ? GROUP BY 1 ORDER BY 2 DESC", (now - WINDOW,)):
+    out["running"].append({"kind": row[0], "count": row[1]})
+for row in c.execute(
+    "SELECT e.workload_class, l.account_id, count(*) "
+    "FROM executions e JOIN route_leases l ON l.session_id=e.session_id "
+    "WHERE e.status='active' AND e.writer_expires_at > ? AND l.updated_at > ? "
+    "GROUP BY 1,2 ORDER BY 3 DESC", (now, now - WINDOW)):
+    out["sessions"].append({"workload": row[0], "account": row[1], "count": row[2]})
+out["session_window_seconds"] = WINDOW
+switches = 0
+for row in c.execute("SELECT payload FROM events WHERE kind='route.changed' AND at > ? LIMIT 400", (now-86400,)):
+    p = json.loads(row["payload"])
+    if p.get("from") and p.get("to") and p["from"] != p["to"]:
+        switches += 1
+out["switches_24h"] = switches
+out["parks_24h"] = c.execute("SELECT count(*) FROM events WHERE kind='execution.parked' AND at > ?", (now-86400,)).fetchone()[0]
+out["routes_24h"] = c.execute("SELECT count(*) FROM events WHERE kind='route.changed' AND at > ?", (now-86400,)).fetchone()[0]
+print(json.dumps(out))
+"""
+
+
+# 服务器结果缓存在这里。ssh 一次要几百毫秒到几秒，而面板每 20 秒刷新一次 ——
+# 每次都走 ssh 既慢又没必要，服务器那边的数变化也没那么快。
+REMOTE_CACHE = Path.home() / ".local" / "state" / "claude-fleet" / "remote-snapshot.json"
+
+
+def _cached_remote(max_age: float) -> Optional[Dict[str, Any]]:
+    try:
+        payload = json.loads(REMOTE_CACHE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    at = payload.get("cached_at")
+    if not isinstance(at, (int, float)) or time.time() - at > max_age:
+        return None
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return None
+    # 让读的人知道这是缓存、有多旧 —— 缓存最糟的用法是假装它是刚取的。
+    data["cache_age_seconds"] = round(time.time() - at, 1)
+    return data
+
+
+def _store_remote(data: Dict[str, Any]) -> None:
+    try:
+        REMOTE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = REMOTE_CACHE.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps({"cached_at": time.time(), "data": data}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        tmp.replace(REMOTE_CACHE)   # 原子替换，读的人不会看到半截文件
+    except OSError:
+        pass
+
+
+def collect_remote(host: str, timeout: int = 12) -> Dict[str, Any]:
+    try:
+        result = subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=8", "-o", "BatchMode=yes", host,
+             "sudo -n -u nature python3 -"],
+            input=REMOTE_SCRIPT, capture_output=True, text=True, timeout=timeout,
+        )
+        if result.returncode != 0:
+            return {"host": "server", "error": (result.stderr or "ssh failed")[:200]}
+        data = json.loads(result.stdout.strip().splitlines()[-1])
+        _store_remote(data)
+        return data
+    except subprocess.TimeoutExpired:
+        return {"host": "server", "error": "timed out"}
+    except Exception as exc:
+        return {"host": "server", "error": str(exc)[:200]}
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="fleet state as JSON")
+    parser.add_argument("--remote", action="store_true", help="include the server")
+    parser.add_argument("--host", default=_peer_host())
+    parser.add_argument(
+        "--remote-max-age", type=float, default=90,
+        help="reuse the cached server block if it is younger than this "
+             "many seconds (0 forces a fresh ssh)",
+    )
+    args = parser.parse_args(argv)
+
+    snapshot: Dict[str, Any] = {"at": time.time(), "hosts": [collect_local()]}
+    if args.remote:
+        remote = _cached_remote(args.remote_max_age) if args.remote_max_age > 0 else None
+        if remote is None:
+            remote = collect_remote(args.host)
+            # ssh 失败时退回任何还在的缓存：带时间戳的旧数据，比一句 "ssh failed"
+            # 有用得多，而年龄就在数据里，不会被误当成新的。
+            if remote.get("error"):
+                stale = _cached_remote(24 * 3600)
+                if stale is not None:
+                    stale["stale_reason"] = remote["error"]
+                    remote = stale
+        snapshot["hosts"].append(remote)
+
+    # One merged view per subscription. The same UUID on both hosts is ONE
+    # account — presenting them separately is what made five subscriptions look
+    # like eight rows.
+    merged: Dict[str, Dict[str, Any]] = {}
+    for host in snapshot["hosts"]:
+        for account in host.get("accounts", []):
+            if not account.get("is_uuid", len(account["id"]) == 36):
+                continue
+            entry = merged.setdefault(account["id"], {
+                "id": account["id"], "name": account["name"],
+                "kind": account.get("kind"), "seen_on": [],
+            })
+            entry["seen_on"].append(host["host"])
+            # The quota fields move together and must come from ONE host — the
+            # one that read them most recently.
+            #
+            # This used to be last-host-wins, which silently preferred the
+            # server because it is appended second. Measured: the Mac had
+            # hello@ at weekly 0.69 / 5h reset 3.2h out, read seconds earlier,
+            # while the server still held 0.44 / 5h reset 6.8h in the PAST from
+            # a reading 6.8 hours old. The stale set overwrote the fresh one, so
+            # the monitor showed a five-hour window that had already rolled over
+            # and a weekly figure a quarter of a window behind.
+            #
+            # Mixing fields across hosts would be worse than either host alone:
+            # a fresh `used` beside a stale `reset_at` describes no real moment.
+            QUOTA = ("weekly_used", "weekly_floor", "weekly_reset_at",
+                     "five_hour_used", "five_hour_reset_at", "remaining")
+            for field in QUOTA + ("state",):
+                entry.setdefault(field, None)
+            entry.setdefault("quota_updated_at", None)
+            fresher = (
+                account.get("quota_updated_at") is not None
+                and (entry["quota_updated_at"] is None
+                     or account["quota_updated_at"] > entry["quota_updated_at"])
+            )
+            if fresher or entry["quota_updated_at"] is None:
+                for field in QUOTA:
+                    if account.get(field) is not None:
+                        entry[field] = account[field]
+                if account.get("quota_updated_at") is not None:
+                    entry["quota_updated_at"] = account["quota_updated_at"]
+            if account.get("state") is not None:
+                entry["state"] = account["state"]
+    snapshot["accounts"] = sorted(
+        merged.values(),
+        key=lambda a: (a.get("weekly_reset_at") or float("inf")),
+    )
+    print(json.dumps(snapshot, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

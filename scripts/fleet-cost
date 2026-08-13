@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""What the subscription usage would have cost at API list prices.
+
+    fleet-cost                       this host
+    fleet-cost --remote              this host plus the server
+    fleet-cost a.json b.json ...     price pre-collected `fleet-tokens` output
+    fleet-cost --json                machine-readable
+
+Input is `fleet-tokens` output carrying `daily_by_model`. Prices come from
+`etc/prices.json`, which is meant to be edited rather than this file.
+
+## Why coverage is printed next to every total
+
+`ccusage` on this machine reported `totalCost: 5.26` across the full history.
+Its bundled price table knows `claude-haiku-4-5` and `claude-sonnet-4-5` and
+none of the Claude 5 models, so it priced those two at their real rate and
+everything else at ZERO — then presented the sum as the total. The priced models
+were 0.25M of 202M non-cached tokens: it put a price on 0.1% of the usage and
+called it the cost.
+
+Nothing here prints a total without stating what share of tokens it managed to
+price and naming every model it could not. An incomplete table then shows up as
+reduced coverage rather than a quietly smaller number.
+
+## Five token classes, not two
+
+  input            base rate
+  output           typically 5x input
+  cache write 5m   1.25x input
+  cache write 1h   2x input        ← 79% of writes here, and NOT the same price
+  cache read       0.1x input      ← 36 BILLION of them; at 0.1x they still cost
+
+Collapsing the two cache-write TTLs, or leaving cache reads out because they are
+"cheap", both produce a number that is wrong by more than the amount most people
+would consider material.
+"""
+
+from __future__ import annotations
+
+
+def _peer_host() -> str:
+    """The other host, from config rather than a literal.
+
+    It used to be a hardcoded hostname, which is both un-publishable and wrong
+    for anyone else's fleet: they would have to edit source to use their own
+    machine. runtime.json already carries this host's identity; the peer belongs
+    next to it.
+    """
+    if os.environ.get("FLEET_PEER"):
+        return os.environ["FLEET_PEER"]
+    try:
+        import json as _json
+        runtime = _json.loads(
+            (pathlib.Path(os.environ.get(
+                "FLEET_RUNTIME_CONFIG",
+                str(pathlib.Path.home() / ".config" / "claude-fleet" / "runtime.json"))
+            )).read_text(encoding="utf-8"))
+        return str(runtime.get("peer_host") or "")
+    except Exception:                                         # noqa: BLE001
+        return ""
+
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from datetime import date, datetime, timezone
+import pathlib
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+HERE = Path(__file__).resolve().parent
+PRICES = HERE.parent / "etc" / "prices.json"
+FIELDS = ("input", "output", "cache_write_5m", "cache_write_1h", "cache_read")
+# The order prices are listed in, which is NOT the order the token tuple is
+# stored in — the tuple is [input, output, 5m, 1h, read] and the price row is
+# [input, 5m, 1h, read, output]. Mapping them by position would silently price
+# output at the cache-read rate.
+PRICE_INDEX = {"input": 0, "cache_write_5m": 1, "cache_write_1h": 2,
+               "cache_read": 3, "output": 4}
+DAY_SECONDS = 86400
+
+
+def _load_prices() -> Dict[str, Any]:
+    try:
+        return json.loads(PRICES.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"cannot read {PRICES}: {exc}", file=sys.stderr)
+        raise SystemExit(2)
+
+
+def _normalise(model: str) -> str:
+    """`claude-haiku-4-5-20251001` and `claude-haiku-4-5` are the same price row.
+
+    Trailing date stamps are stripped; nothing else is guessed. A model that
+    does not match a row stays unpriced and is reported as such.
+    """
+    parts = model.split("-")
+    while parts and parts[-1].isdigit() and len(parts[-1]) == 8:
+        parts.pop()
+    return "-".join(parts)
+
+
+def _rate(prices: Dict[str, Any], model: str, day: Optional[date]) -> Optional[List[float]]:
+    key = _normalise(model)
+    dated = (prices.get("_dated") or {}).get(key)
+    if dated and day is not None:
+        for window in dated:
+            until = window.get("until")
+            start = window.get("from")
+            if until and day <= date.fromisoformat(until):
+                return window["prices"]
+            if start and day >= date.fromisoformat(start):
+                return window["prices"]
+    row = prices.get(key)
+    return row if isinstance(row, list) else None
+
+
+def price_report(sources: List[Tuple[str, Dict[str, Any]]],
+                 prices: Dict[str, Any]) -> Dict[str, Any]:
+    per_model: Dict[str, Dict[str, Any]] = {}
+    unpriced_days = 0
+
+    for _, payload in sources:
+        daily = payload.get("daily_by_model") or {}
+        for day_key, models in daily.items():
+            try:
+                day = datetime.fromtimestamp(
+                    int(day_key) * DAY_SECONDS, timezone.utc).date()
+            except (ValueError, OSError, OverflowError):
+                day = None
+                unpriced_days += 1
+            for model, values in models.items():
+                entry = per_model.setdefault(model, {
+                    "tokens": dict.fromkeys(FIELDS, 0), "cost": 0.0, "priced": True,
+                })
+                rate = _rate(prices, model, day)
+                if rate is None:
+                    entry["priced"] = False
+                for index, field in enumerate(FIELDS):
+                    amount = int(values[index]) if index < len(values) else 0
+                    entry["tokens"][field] += amount
+                    if rate is not None:
+                        entry["cost"] += amount * rate[PRICE_INDEX[field]] / 1_000_000
+
+    # 零 token 的模型（比如 Claude Code 的 <synthetic> 占位）不算"未定价" ——
+    # 它没有量，报出来只会让人以为有一块钱没算进去。
+    for model in [m for m, e in per_model.items() if sum(e["tokens"].values()) == 0]:
+        per_model[model]["priced"] = True
+    priced_tokens = sum(sum(e["tokens"].values()) for e in per_model.values() if e["priced"])
+    all_tokens = sum(sum(e["tokens"].values()) for e in per_model.values())
+    totals = dict.fromkeys(FIELDS, 0)
+    for entry in per_model.values():
+        for field in FIELDS:
+            totals[field] += entry["tokens"][field]
+
+    return {
+        "hosts": [name for name, _ in sources],
+        "per_model": per_model,
+        "totals": totals,
+        "total_tokens": all_tokens,
+        "priced_tokens": priced_tokens,
+        "cost_usd": sum(e["cost"] for e in per_model.values()),
+        # The whole point. A total without this is a claim, not a measurement.
+        "coverage": (priced_tokens / all_tokens) if all_tokens else 0.0,
+        "unpriced_models": sorted(m for m, e in per_model.items() if not e["priced"]),
+        "price_source": prices.get("_source"),
+        "price_date": prices.get("_fetched"),
+    }
+
+
+def _collect(remote: bool, host: str) -> List[Tuple[str, Dict[str, Any]]]:
+    sources: List[Tuple[str, Dict[str, Any]]] = []
+    local = subprocess.run([str(HERE / "fleet-tokens")],
+                           capture_output=True, text=True, timeout=120)
+    if local.returncode == 0 and local.stdout.strip():
+        sources.append(("本机", json.loads(local.stdout)))
+    if remote:
+        result = subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", host,
+             "sudo -n -u nature env HOME=/home/nature "
+             "/home/nature/.local/share/claude-fleet/scripts/fleet-tokens"],
+            capture_output=True, text=True, timeout=180)
+        if result.returncode == 0 and result.stdout.strip():
+            sources.append(("硅谷", json.loads(result.stdout.splitlines()[-1])))
+        else:
+            print("硅谷不可达，下面只是本机的数",
+                  file=sys.stderr)
+    return sources
+
+
+def _human(value: float) -> str:
+    for limit, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if abs(value) >= limit:
+            return f"{value / limit:.2f}{suffix}"
+    return str(int(value))
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="cost of token usage at list prices")
+    parser.add_argument("files", nargs="*", help="fleet-tokens JSON to price")
+    parser.add_argument("--remote", action="store_true")
+    parser.add_argument("--host", default=_peer_host())
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+
+    if args.files:
+        sources = [(Path(f).stem, json.loads(Path(f).read_text(encoding="utf-8")))
+                   for f in args.files]
+    else:
+        sources = _collect(args.remote, args.host)
+    if not sources:
+        print("没有可用的用量数据", file=sys.stderr)
+        return 2
+
+    report = price_report(sources, _load_prices())
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False))
+        return 0
+
+    print(f"来源：{' + '.join(report['hosts'])}")
+    print(f"价格：{report['price_source']}（{report['price_date']} 取）\n")
+
+    rows = sorted(report["per_model"].items(), key=lambda kv: -kv[1]["cost"])
+    print(f"{'模型':<26}{'输入':>9}{'输出':>10}{'缓存写5m':>11}{'缓存写1h':>11}{'缓存读':>11}{'美元':>10}")
+    for model, entry in rows:
+        t = entry["tokens"]
+        mark = "" if entry["priced"] else "  ← 无价格"
+        print(f"{model:<26}{_human(t['input']):>9}{_human(t['output']):>10}"
+              f"{_human(t['cache_write_5m']):>11}{_human(t['cache_write_1h']):>11}"
+              f"{_human(t['cache_read']):>11}{entry['cost']:>10.2f}{mark}")
+
+    t = report["totals"]
+    print(f"\n{'合计':<26}{_human(t['input']):>9}{_human(t['output']):>10}"
+          f"{_human(t['cache_write_5m']):>11}{_human(t['cache_write_1h']):>11}"
+          f"{_human(t['cache_read']):>11}{report['cost_usd']:>10.2f}")
+
+    print(f"\n非缓存 token（输入+输出）：{_human(t['input'] + t['output'])}")
+    print(f"缓存 token（写+读）：      {_human(t['cache_write_5m'] + t['cache_write_1h'] + t['cache_read'])}")
+    print(f"总计：                     {_human(report['total_tokens'])}")
+    print(f"\n按 API 标价折算：${report['cost_usd']:,.2f}")
+    unpriced = report["total_tokens"] - report["priced_tokens"]
+    print(f"定价覆盖率：{report['coverage'] * 100:.4f}% 的 token"
+          + (f"（{_human(unpriced)} 未定价）" if unpriced else ""))
+    if report["unpriced_models"]:
+        print(f"未定价的模型：{', '.join(report['unpriced_models'])}")
+        print("这些模型的 token 计入了用量，但没有计入金额。")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

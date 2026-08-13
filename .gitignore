@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+
+# A stray state database. cli.py's default_db() falls back to
+# ./work/claude-fleet.sqlite3 when there is no runtime config, so any command run
+# from the repository root without one creates it here. Tracking it was harmless
+# in content — every table was empty — but not in effect: SQLite's -wal and -shm
+# go dirty the moment anything writes, and a dirty tree is what makes
+# fleet-rollback refuse to run. An emergency rollback blocked by a file the tool
+# itself created is the worst possible time to discover this.
+work/

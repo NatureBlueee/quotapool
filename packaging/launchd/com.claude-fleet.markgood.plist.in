@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.claude-fleet.markgood</string>
+  <key>ProgramArguments</key>
+  <array><string>@HOME@/.local/share/claude-fleet/scripts/fleet-rollback</string><string>mark</string></array>
+  <!-- Hourly. The mark refuses on its own until the soak passes, so trying
+       often costs nothing and means a good version becomes available to roll
+       back TO without anyone remembering to record it. -->
+  <key>StartInterval</key><integer>3600</integer>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>@HOME@/.local/state/claude-fleet/markgood.log</string>
+  <key>StandardErrorPath</key><string>@HOME@/.local/state/claude-fleet/markgood.error.log</string>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+</dict>
+</plist>

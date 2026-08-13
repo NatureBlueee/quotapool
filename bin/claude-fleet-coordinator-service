@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+RUNTIME=${FLEET_RUNTIME_CONFIG:-"$HOME/.config/claude-fleet/runtime.json"}
+CONFIG_DIR=$(dirname "$RUNTIME")
+DB_PATH=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["db_path"])' "$RUNTIME")
+TOKEN=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["fleetCoordinator"]["token"])' "$CONFIG_DIR/teamclaude.json")
+export FLEET_RUNTIME_CONFIG="$RUNTIME"
+export FLEET_COORDINATOR_TOKEN="$TOKEN"
+BIN_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "$BIN_DIR/fleet" --db "$DB_PATH" coordinator

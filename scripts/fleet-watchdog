@@ -1,0 +1,584 @@
+#!/usr/bin/env python3
+"""Notice the fleet is broken, put it back, and make sure somebody finds out.
+
+    fleet-watchdog            check, and act if the fleet is down
+    fleet-watchdog --check    check only, never act
+    fleet-watchdog --status   what it has seen, and whether it has ever acted
+
+## The hole this fills
+
+Everything else in this repository is one half of the job:
+
+    release-gate.sh        checks before a deploy — only when I run it
+    fleet-reload-service   verifies a service swap  — only when swapping one
+    markgood (hourly)      RECORDS a good version   — never acts on a bad one
+    fleet-rollback now     goes back                — needs a person to type it
+    fleet backup           snapshots the database   — needs a person, or a deploy
+
+Nothing closed the loop. A version that passed every check and then broke ten
+minutes later — which is what every outage here has actually looked like — would
+sit broken until the owner noticed by hand. That is the thing he asked never to
+happen again, and it is the one thing none of the above does.
+
+## What it will not do, and why each one matters
+
+- **Act on a blip.** A single failed probe is a network hiccup, a restart in
+  progress, a laptop that just woke. It takes FAILURES_BEFORE_ACTING consecutive
+  failures, spaced by the timer, before it moves.
+- **Roll back to the version that is already running.** If the newest known-good
+  point IS HEAD, going "back" changes nothing and would just restart services in
+  a loop while the real fault stays.
+- **Roll back twice in a row.** After acting it will not act again for
+  COOLDOWN_SECONDS. If the rollback did not help, the fault is not the version,
+  and thrashing services would make a bad situation worse.
+- **Depend on the fleet.** Like `claude-direct`, it imports nothing from
+  `claude_fleet`. A watchdog that needs a working control plane to notice a
+  broken control plane is decoration.
+- **Watch only the machine it runs on.** A two-host fleet is down when either
+  half is, and the server has no watchdog of its own — so this one asks both.
+  One instance rather than one per host, because two watchdogs each triggering
+  a two-host rollback is a split brain, not redundancy.
+- **Confuse "I cannot see it" with "it is down".** From here those look
+  identical and call for opposite actions. Blindness gets its own counter and
+  its own alarm; it never triggers a rollback.
+- **Act silently.** Every action writes to a file the status line reads, so the
+  next prompt says it happened. A rollback nobody knows about is its own outage.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+REPO = Path(__file__).resolve().parent.parent
+STATE_DIR = Path.home() / ".local" / "state" / "claude-fleet"
+STATE = STATE_DIR / "watchdog.json"
+# Read by the status line so an automatic rollback reaches the owner at his next
+# prompt rather than waiting to be discovered.
+ALARM = STATE_DIR / "watchdog-alarm.json"
+
+# Three consecutive failures at the timer's cadence. Long enough that a restart,
+# a suspend/resume, or one refused connection does not trigger a deploy; short
+# enough that a genuine outage is measured in minutes.
+FAILURES_BEFORE_ACTING = 3
+# After acting, leave it alone. If a rollback did not fix it, the fault is not
+# the version, and repeatedly restarting services makes it worse.
+COOLDOWN_SECONDS = 3600
+PROBE_TIMEOUT = 8
+
+BOLD, DIM, RED, GREEN, YELLOW, RESET = (
+    "\033[1m", "\033[2m", "\033[31m", "\033[32m", "\033[33m", "\033[0m")
+
+
+def _load(path: Path, default: Any) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return default
+
+
+def _save(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(".tmp")
+    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+    os.replace(str(temp), str(path))
+
+
+# ---------------------------------------------------------------------------
+# the probe — deliberately the same question `fleet-rollback mark` asks
+# ---------------------------------------------------------------------------
+
+def _runtime() -> Dict[str, Any]:
+    path = os.environ.get(
+        "FLEET_RUNTIME_CONFIG",
+        str(Path.home() / ".config" / "claude-fleet" / "runtime.json"))
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+# One snippet, because both hosts have to be asked the same question.
+#
+# Not `/health`, which takes no credentials — that is exactly how a fleet with
+# broken authentication looked alive to every check in this system for as long
+# as the hole existed. `/v1/pin/check` authenticates, reads an account out of
+# SQLite and applies the eligibility rules, and writes nothing.
+#
+# It runs as a subprocess even for this machine. One implementation for two
+# hosts is worth more than the subprocess it saves every five minutes: a local
+# check and a remote check that drifted apart would disagree about what
+# "serving" means, and that disagreement would surface at the worst hour.
+_PROBE = r'''
+import json, os, socket, urllib.error, urllib.request
+
+path = os.environ.get("FLEET_RUNTIME_CONFIG",
+                      os.path.expanduser("~/.config/claude-fleet/runtime.json"))
+try:
+    runtime = json.load(open(path))
+    tc = json.load(open(runtime["teamclaude_config"]))
+except Exception as exc:
+    print(json.dumps({"ok": False, "why": "配置读不到: %s" % str(exc)[:80]}))
+    raise SystemExit(0)
+
+token = (tc.get("fleetCoordinator") or {}).get("token")
+oauth = [a for a in tc.get("accounts", []) if a.get("type") == "oauth"]
+account = (oauth[0].get("accountUuid") or oauth[0].get("name")) if oauth else "probe"
+
+headers = {"Content-Type": "application/json"}
+if token:
+    headers["Authorization"] = "Bearer " + token
+req = urllib.request.Request(
+    "http://127.0.0.1:%d/v1/pin/check" % int(runtime.get("coordinator_port") or 17891),
+    data=json.dumps({"account_id": account}).encode("utf-8"),
+    method="POST", headers=headers)
+# An outbound proxy in the environment must not be used for loopback, or the
+# probe measures the proxy instead of the fleet.
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+try:
+    with opener.open(req, timeout=8) as response:
+        status = response.status
+except urllib.error.HTTPError as exc:
+    status = exc.code
+except Exception as exc:
+    print(json.dumps({"ok": False, "why": "协调器没有应答: %s" % str(exc)[:80]}))
+    raise SystemExit(0)
+
+if status in (401, 403):
+    print(json.dumps({"ok": False, "why": "鉴权被拒 (HTTP %d)" % status}))
+    raise SystemExit(0)
+if status == 404:
+    print(json.dumps({"ok": False, "why": "协调器上没有这个端点 —— 版本不对"}))
+    raise SystemExit(0)
+
+# The data plane too: the coordinator can be perfectly healthy while the thing
+# that actually carries requests is not.
+proxy_port = int(runtime.get("proxy_port") or 13456)
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.settimeout(2)
+listening = sock.connect_ex(("127.0.0.1", proxy_port)) == 0
+sock.close()
+if not listening:
+    print(json.dumps({"ok": False, "why": "数据面端口 %d 没有监听" % proxy_port}))
+    raise SystemExit(0)
+
+print(json.dumps({"ok": True, "why": "协调器 HTTP %d, 数据面在监听" % status}))
+'''
+
+UNREACHABLE = "unreachable"
+# Twelve consecutive misses is an hour of being awake and unable to see the
+# other host. Fewer would alarm every time a laptop wakes before its network
+# does, and an alarm that fires most mornings is one nobody reads.
+BLIND_BEFORE_ALARM = 12
+
+# How old the newest known-good point may get before this says so.
+#
+# A day, because that is roughly when "we have been shipping all afternoon"
+# turns into "there is no recent version to go back to". It will fire during a
+# long development session, and that is correct: the rollback target really is
+# stale then.
+#
+# This exists because of a specific silence. `markgood` runs hourly and had
+# refused every hour for five days — accounts got banned, so `doctor` was never
+# clean, so `mark` refused — while writing "拒绝标记" into a log nobody opens.
+# The newest known-good point sat 126 hours back, at a commit predating this
+# watchdog, `claude-direct` and the database backup. An automatic rollback would
+# have removed the watchdog as its first act. Every individual piece was
+# installed and running; the mechanism as a whole was disarmed and said so
+# nowhere anybody looks.
+KNOWN_GOOD_STALE_AFTER = 24 * 3600
+
+
+def _peer() -> Optional[str]:
+    """The other host, if this fleet has one. Most installs will not."""
+    override = os.environ.get("FLEET_PEER")
+    if override is not None:
+        return override or None
+    try:
+        return _runtime().get("peer_host") or None
+    except Exception:                                         # noqa: BLE001
+        return None
+
+
+def _probe(host: Optional[str]) -> Dict[str, Any]:
+    """Ask one host whether it can serve. `host=None` is this machine."""
+    try:
+        if host:
+            result = subprocess.run(
+                ["ssh", "-o", "ConnectTimeout=8", "-o", "BatchMode=yes",
+                 host, "HOME=/home/nature python3 -"],
+                input=_PROBE, capture_output=True, text=True,
+                timeout=PROBE_TIMEOUT * 4)
+        else:
+            result = subprocess.run([sys.executable, "-c", _PROBE],
+                                    capture_output=True, text=True,
+                                    timeout=PROBE_TIMEOUT * 4)
+    except Exception as exc:                                  # noqa: BLE001
+        return {"ok": False, "reach": UNREACHABLE,
+                "why": "探针没能运行: %s" % str(exc)[:80]}
+    if result.returncode != 0:
+        return {"ok": False, "reach": UNREACHABLE,
+                "why": "够不着: %s"
+                       % (result.stderr or result.stdout).strip()[-80:]}
+    try:
+        answer = json.loads(result.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {"ok": False, "reach": UNREACHABLE,
+                "why": "探针没有给出能解析的回答"}
+    answer["reach"] = "reached"
+    return answer
+
+
+def _assess() -> Dict[str, Any]:
+    """Both hosts, because a fleet with half of it down is a fleet that is down.
+
+    The server had no watchdog of its own and this one only ever looked at the
+    machine it runs on, so an outage there was detected by nobody.
+
+    One asymmetry is deliberate. **A peer that cannot be reached at all is not
+    reported as down.** From here those two look identical — the server is off,
+    or this laptop's network is — and they call for opposite actions. Rolling
+    back both hosts because a laptop lost wifi would be the watchdog causing the
+    outage it exists to prevent. Blindness gets its own counter and its own
+    alarm instead; being unable to see a host is a real problem, just not one a
+    rollback fixes.
+    """
+    peer_host = _peer()
+    hosts = {"本机": _probe(None)}
+    if peer_host:
+        hosts[peer_host] = _probe(peer_host)
+
+    blind = bool(peer_host and hosts[peer_host].get("reach") == UNREACHABLE)
+    down = [name for name, h in hosts.items()
+            if not h["ok"] and not (blind and name == peer_host)]
+
+    detail = {name: h["why"] for name, h in hosts.items()}
+    if down:
+        return {"ok": False, "blind": blind, "hosts": detail,
+                "why": "; ".join("%s %s" % (n, detail[n]) for n in down)}
+    return {"ok": True, "blind": blind, "hosts": detail,
+            "why": "; ".join("%s %s" % (n, detail[n]) for n in hosts)}
+
+
+# ---------------------------------------------------------------------------
+
+def _rollback_target() -> Optional[str]:
+    """The newest known-good commit that is NOT what is running.
+
+    Rolling back to the running version restarts services and changes nothing,
+    which is worse than doing nothing: it looks like action.
+    """
+    marks = STATE_DIR / "known-good.jsonl"
+    try:
+        head = subprocess.run(["git", "-C", str(REPO), "rev-parse", "HEAD"],
+                              capture_output=True, text=True).stdout.strip()
+        entries = [json.loads(line) for line in
+                   marks.read_text(encoding="utf-8").splitlines() if line.strip()]
+    except Exception:                                         # noqa: BLE001
+        return None
+    for entry in reversed(entries):
+        sha = entry.get("sha")
+        if not sha or sha == head:
+            continue
+        exists = subprocess.run(
+            ["git", "-C", str(REPO), "cat-file", "-e", "%s^{commit}" % sha],
+            capture_output=True).returncode == 0
+        if exists:
+            return sha
+    return None
+
+
+def _newest_mark() -> Optional[Dict[str, Any]]:
+    """The most recent known-good entry, or None if there has never been one."""
+    try:
+        entries = [json.loads(line) for line in
+                   (STATE_DIR / "known-good.jsonl")
+                   .read_text(encoding="utf-8").splitlines() if line.strip()]
+    except (OSError, ValueError):
+        return None
+    return entries[-1] if entries else None
+
+
+def _check_rollback_point_is_recent(state: Dict[str, Any], now: float) -> bool:
+    """Is there somewhere recent to roll back to? Report once per staleness.
+
+    Not conditional on WHY it is stale. A day-old rollback target is a problem
+    whether the cause is a jammed gate or a busy afternoon, and requiring this
+    to diagnose the cause before speaking is how it would end up saying nothing.
+    """
+    mark = _newest_mark()
+    age = None if not mark else now - float(mark.get("at") or 0)
+    stale = mark is None or age > KNOWN_GOOD_STALE_AFTER
+
+    if not stale:
+        state["known_good_reported"] = None
+        _set_condition("known_good", None)
+        return True
+
+    # "Never marked anything" needs a signature of its own. Using None for it
+    # collides with the absent key on a fresh state file — `.get()` returns None
+    # too — so the very first run on a machine with no known-good point would
+    # decide it had already reported and say nothing. The loudest case, silent.
+    signature = "(never marked)" if mark is None else mark.get("sha")
+    first_time = state.get("known_good_reported") != signature
+    state["known_good_reported"] = signature
+
+    if mark is None:
+        entry = {"kind": "known_good_missing",
+                 "why": "known-good.jsonl 里一条记录都没有"}
+        line = "  %s没有任何已知良好点%s —— 真出事时无处可退" % (YELLOW, RESET)
+    else:
+        entry = {
+            "kind": "known_good_stale",
+            "hours": round(age / 3600),
+            "why": "最新的已知良好点是 %.0f 小时前的 %s；"
+                   "先看 markgood 为什么没标上（%s）"
+                   % (age / 3600, str(mark.get("sha"))[:10],
+                      STATE_DIR / "markgood.error.log"),
+            "target": mark.get("sha"),
+        }
+        line = ("  %s最新的已知良好点已经 %.0f 小时前了%s —— 自动回滚会退到那儿"
+                % (YELLOW, age / 3600, RESET))
+
+    # Printed once per (episode, target); a new mark that is still old is worth
+    # saying again, the same one every five minutes is not. But the CONDITION is
+    # written every pass, and that separation is the point: the earlier version
+    # returned early on the dedupe and never wrote it, so a cleared alarm file —
+    # or, as it happened here, an upgrade — left the problem live and the
+    # indicator blank. Keeping the original `at` is what makes it "raised once"
+    # rather than "re-raised every five minutes".
+    if first_time:
+        print(line)
+    _set_condition("known_good", entry, keep_raised_at=not first_time)
+    return False
+
+
+def _raise_alarm(entry: Dict[str, Any]) -> None:
+    """Something HAPPENED. The status line reads this file.
+
+    Events are history and stay: a rollback that ran two hours ago is still
+    worth knowing about, because the owner is running a version he did not
+    choose. Conditions are the other shape — see `_set_condition`.
+    """
+    history = _load(ALARM, {"events": []})
+    history.setdefault("events", []).append(entry)
+    history["events"] = history["events"][-20:]
+    history["latest"] = entry
+    _save(ALARM, history)
+
+
+def _set_condition(name: str, entry: Optional[Dict[str, Any]],
+                   keep_raised_at: bool = False) -> None:
+    """Something IS TRUE, or has stopped being true.
+
+    A stale rollback point and an unreachable peer are states, not events. Left
+    in the event list they would sit on the status line forever after being
+    fixed, and an indicator that stays red after the problem is gone teaches
+    people to ignore it — which costs more than never having shown it.
+
+    `keep_raised_at` refreshes the detail while preserving when it was first
+    noticed, so "this has been true for three hours" stays readable.
+    """
+    history = _load(ALARM, {"events": []})
+    conditions = history.setdefault("conditions", {}) or {}
+    history["conditions"] = conditions
+    if entry is not None:
+        entry = dict(entry)
+        previous = conditions.get(name) or {}
+        entry["at"] = (previous.get("at") if keep_raised_at and previous
+                       else time.time())
+    if entry is None:
+        # Clearing something that was never set must not create the file. "No
+        # alarm file" is the honest representation of a fleet that has never had
+        # anything wrong, and an empty file in its place would make every
+        # existence check — including the status line's — meaningless.
+        if name not in conditions:
+            return
+        conditions.pop(name)
+    else:
+        conditions[name] = entry
+    _save(ALARM, history)
+
+
+def check(act: bool) -> int:
+    state = _load(STATE, {"consecutive_failures": 0, "last_action_at": 0,
+                          "history": []})
+    result = _assess()
+    now = time.time()
+
+    state["history"] = (state.get("history") or [])[-49:] + [
+        {"at": now, "ok": result["ok"], "why": result["why"],
+         "hosts": result.get("hosts")}]
+
+    # Blindness is tracked whether or not anything is down, and it is reported
+    # once per streak rather than every five minutes.
+    blind_streak = int(state.get("peer_blind_streak") or 0)
+    if result.get("blind"):
+        blind_streak += 1
+        if blind_streak == BLIND_BEFORE_ALARM:
+            print("  %s看不见对端%s —— 连续 %d 次够不着, 已经一小时不知道它的状态"
+                  % (YELLOW, RESET, blind_streak))
+        if blind_streak >= BLIND_BEFORE_ALARM:
+            # Written every pass, printed once. Same reason as the known-good
+            # condition: an early return would leave the indicator blank while
+            # the problem is live, which is the whole failure being fixed here.
+            _set_condition("peer", {"kind": "peer_unreachable",
+                                    "why": result["why"],
+                                    "misses": blind_streak},
+                           keep_raised_at=blind_streak > BLIND_BEFORE_ALARM)
+    elif blind_streak:
+        print("  %s又能看见对端了%s（此前连续 %d 次够不着）"
+              % (GREEN, RESET, blind_streak))
+        blind_streak = 0
+        _set_condition("peer", None)
+    state["peer_blind_streak"] = blind_streak
+
+    # Checked on every pass, not only when something is broken. By the time the
+    # fleet is down it is far too late to discover there is nowhere to go back
+    # to — that is precisely the state this ran in for five days.
+    _check_rollback_point_is_recent(state, now)
+
+    if result["ok"]:
+        if state.get("consecutive_failures"):
+            print("  %s恢复%s —— 连续 %d 次失败后又能应答了"
+                  % (GREEN, RESET, state["consecutive_failures"]))
+        state["consecutive_failures"] = 0
+        _save(STATE, state)
+        return 0
+
+    state["consecutive_failures"] = int(state.get("consecutive_failures", 0)) + 1
+    failures = state["consecutive_failures"]
+    print("  %s✗%s %s  (连续第 %d 次, %d 次后动作)"
+          % (RED, RESET, result["why"], failures, FAILURES_BEFORE_ACTING))
+
+    if failures < FAILURES_BEFORE_ACTING:
+        _save(STATE, state)
+        return 1
+
+    if not act:
+        print("  %s--check: 不采取动作%s" % (DIM, RESET))
+        _save(STATE, state)
+        return 1
+
+    since_action = now - float(state.get("last_action_at") or 0)
+    if since_action < COOLDOWN_SECONDS:
+        # Not silence — a fleet that is still down after a rollback is a bigger
+        # problem than the one the rollback was for, and it has to say so.
+        print("  %s冷却中%s（%.0f 分钟前刚回滚过, 还没恢复 —— 问题不在版本）"
+              % (YELLOW, RESET, since_action / 60))
+        _raise_alarm({"at": now, "kind": "still_down_after_rollback",
+                      "why": result["why"],
+                      "minutes_since_rollback": round(since_action / 60)})
+        _save(STATE, state)
+        return 2
+
+    target = _rollback_target()
+    if not target:
+        print("  %s没有可回退的已知良好点%s —— 只能告警" % (YELLOW, RESET))
+        _raise_alarm({"at": now, "kind": "down_no_target", "why": result["why"]})
+        state["last_action_at"] = now
+        _save(STATE, state)
+        return 2
+
+    print("  %s连续 %d 次失败 —— 自动回滚到 %s%s"
+          % (BOLD, failures, target[:10], RESET))
+    rollback = subprocess.run(
+        [str(REPO / "scripts" / "fleet-rollback"), "to", target],
+        capture_output=True, text=True, timeout=600)
+    ok = rollback.returncode == 0
+
+    state["last_action_at"] = now
+    state["consecutive_failures"] = 0
+    _save(STATE, state)
+    _raise_alarm({
+        "at": now,
+        "kind": "rolled_back" if ok else "rollback_failed",
+        "why": result["why"],
+        "target": target,
+        "output": (rollback.stdout or rollback.stderr)[-600:],
+    })
+    print("  %s%s%s" % (GREEN if ok else RED,
+                        "回滚完成" if ok else "回滚本身也失败了 —— 需要人",
+                        RESET))
+    return 0 if ok else 3
+
+
+def status() -> int:
+    state = _load(STATE, {})
+    alarm = _load(ALARM, {})
+    history = state.get("history") or []
+    recent = history[-10:]
+
+    peer = _peer()
+    print("%s看门狗%s" % (BOLD, RESET))
+    print("  监视            本机%s" % ("" if not peer else " + %s" % peer))
+    print("  连续失败      %d / %d" % (state.get("consecutive_failures", 0),
+                                       FAILURES_BEFORE_ACTING))
+    blind = int(state.get("peer_blind_streak") or 0)
+    if blind:
+        print("  %s够不着对端    连续 %d 次 / %d 次后告警%s"
+              % (YELLOW, blind, BLIND_BEFORE_ALARM, RESET))
+
+    mark = _newest_mark()
+    if mark is None:
+        print("  %s可回退到      没有已知良好点%s" % (RED, RESET))
+    else:
+        age = (time.time() - float(mark.get("at") or 0)) / 3600
+        colour = YELLOW if age * 3600 > KNOWN_GOOD_STALE_AFTER else ""
+        print("  可回退到      %s%s，%.0f 小时前%s"
+              % (colour, str(mark.get("sha"))[:10], age, RESET if colour else ""))
+    if history:
+        bad = sum(1 for h in history if not h["ok"])
+        print("  最近 %d 次探测  %d 次失败" % (len(history), bad))
+        for item in recent:
+            mark = "✓" if item["ok"] else "✗"
+            print("    %s %s  %s" % (
+                mark, time.strftime("%m-%d %H:%M", time.localtime(item["at"])),
+                item["why"]))
+    else:
+        print("  还没探测过")
+
+    latest = alarm.get("latest")
+    if latest:
+        print("\n  %s最近一次动作%s  %s  %s" % (
+            YELLOW, RESET,
+            time.strftime("%m-%d %H:%M", time.localtime(latest["at"])),
+            latest["kind"]))
+        print("    原因: %s" % latest.get("why"))
+        if latest.get("target"):
+            print("    回退到: %s" % latest["target"][:10])
+    else:
+        print("\n  %s从未动作过%s" % (DIM, RESET))
+    return 0
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="fleet-watchdog",
+        description="发现舰队坏了就自动回滚, 并且让人知道。")
+    parser.add_argument("--check", action="store_true", help="只探测, 不动作")
+    parser.add_argument("--status", action="store_true", help="看它见过什么")
+    parser.add_argument("--quiet", action="store_true", help="只在异常时输出")
+    args = parser.parse_args(argv)
+
+    if args.status:
+        return status()
+    if args.quiet:
+        import io
+        import contextlib
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = check(act=not args.check)
+        if code != 0:
+            sys.stderr.write(buffer.getvalue())
+        return code
+    return check(act=not args.check)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

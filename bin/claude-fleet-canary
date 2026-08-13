@@ -1,0 +1,79 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 2 ]; then
+  printf '%s\n' "Usage: $0 ACCOUNT_A_ID ACCOUNT_B_ID" >&2
+  exit 64
+fi
+
+ACCOUNT_A=$1
+ACCOUNT_B=$2
+FLEET=${FLEET_BINARY:-"$HOME/.local/bin/fleet"}
+SESSION=$(uuidgen | tr '[:upper:]' '[:lower:]')
+EXECUTION="canary-$SESSION"
+HOLDER="canary-bootstrap-$SESSION"
+LAUNCH_ID="canary-launch-$SESSION"
+CANARY_FINISHED=0
+
+cleanup() {
+  if [ "$CANARY_FINISHED" -eq 1 ]; then
+    status=completed
+  else
+    status=abandoned
+  fi
+  "$FLEET" execution release "$SESSION" --status "$status" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT HUP INT TERM
+
+"$FLEET" execution register "$SESSION" --id "$EXECUTION" --class interactive >/dev/null
+"$FLEET" writer acquire "$SESSION" "$HOLDER" --ttl 1 >/dev/null
+"$FLEET" route pin "$SESSION" "$ACCOUNT_A" >/dev/null
+sleep 2
+
+FIRST=$("$FLEET" run --execution-id "$EXECUTION" --launch-id "$LAUNCH_ID" -- \
+  --print --setting-sources "" --session-id "$SESSION" --tools "" -- \
+  "Reply with exactly FLEET_CANARY_A")
+if [ "$FIRST" != "FLEET_CANARY_A" ]; then
+  printf '%s\n' "First account canary returned unexpected output." >&2
+  exit 1
+fi
+
+"$FLEET" execution release "$SESSION" --status parked >/dev/null
+"$FLEET" route pin "$SESSION" >/dev/null
+"$FLEET" route next "$SESSION" "$ACCOUNT_B" >/dev/null
+SECOND=$("$FLEET" run --execution-id "$EXECUTION" --launch-id "$LAUNCH_ID" -- \
+  --print --setting-sources "" --resume "$SESSION" --tools "" -- \
+  "Reply with exactly FLEET_CANARY_B")
+if [ "$SECOND" != "FLEET_CANARY_B" ]; then
+  printf '%s\n' "Second account canary returned unexpected output." >&2
+  exit 1
+fi
+
+python3 - "$HOME/.local/state/claude-fleet/fleet.sqlite3" "$SESSION" "$ACCOUNT_A" "$ACCOUNT_B" <<'PY'
+import json
+import sqlite3
+import sys
+
+db, session, expected_a, expected_b = sys.argv[1:]
+conn = sqlite3.connect(db)
+conn.row_factory = sqlite3.Row
+events = [
+    json.loads(row["payload"])
+    for row in conn.execute(
+        "SELECT payload FROM events WHERE kind='route.changed' AND subject=? ORDER BY seq",
+        (session,),
+    )
+]
+if not any(item.get("to") == expected_a for item in events):
+    raise SystemExit("No verified route to first account")
+if not any(item.get("to") == expected_b for item in events):
+    raise SystemExit("No verified route to second account")
+print(json.dumps({
+    "ok": True,
+    "session_id": session,
+    "first_account": expected_a,
+    "second_account": expected_b,
+    "route_changes": len(events),
+}))
+PY
+CANARY_FINISHED=1

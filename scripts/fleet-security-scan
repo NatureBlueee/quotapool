@@ -1,0 +1,103 @@
+#!/bin/sh
+# Run the security review the same way every time.
+#
+#   fleet-security-scan             scan the whole tree
+#   fleet-security-scan --diff BASE scan what changed since BASE
+#   fleet-security-scan --deep      the slower, broader mode
+#
+# ## Why a wrapper rather than a documented command line
+#
+# The scan is only as good as the context it is given. `--knowledge-base` is
+# what decides whether it looks for this program's actual risks — token
+# exfiltration, a torn credential file, the CA's scope, refresh-token races —
+# or for the generic web-app patterns this program does not have. A command
+# somebody retypes from a README will drift from that; a script will not.
+#
+# It also pins the things that are easy to get wrong once and never notice:
+# a cost ceiling, an output directory outside the repository (so results are
+# never accidentally committed), and the proxy the owner requires for anything
+# that talks to a model.
+#
+# ## What it cannot tell you
+#
+# The scanner reads code. This program's largest risks are not all in the code:
+# the CA's trust scope, the file permissions, what ends up in a published tree,
+# and whether `FLEET_AUTH_MODE` is enforced on a given host are all decided
+# elsewhere. `coverage.json` in the results names what it did not reach, and
+# that list is meant to be read, not filed.
+set -eu
+
+PREFIX=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+RESULTS="${FLEET_SCAN_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-fleet/security-scans}"
+
+# Informational under a ChatGPT subscription (auth_mode: chatgpt draws on the
+# subscription, and the dollar figures are estimates of the API-equivalent), but
+# a hard stop if anyone ever runs this with an API key configured.
+MAX_COST="${FLEET_SCAN_MAX_COST:-25}"
+
+# Everything that tells the scanner what this program is and what is worth
+# stealing. THREAT-MODEL.md is the important one — it also lists the things that
+# look like findings and are not, so an evening is not spent triaging the
+# deliberately-invalid sentinel token.
+KNOWLEDGE="--knowledge-base $PREFIX/THREAT-MODEL.md
+--knowledge-base $PREFIX/ARCHITECTURE.md
+--knowledge-base $PREFIX/SECURITY.md
+--knowledge-base $PREFIX/NOTICE"
+
+MODE=""
+DIFF=""
+for arg in "$@"; do
+  case "$arg" in
+    --deep) MODE="--mode deep" ;;
+    --diff=*) DIFF="--diff ${arg#--diff=}" ;;
+    -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) printf 'fleet-security-scan: unknown argument: %s\n' "$arg" >&2; exit 2 ;;
+  esac
+done
+
+command -v codex-security >/dev/null 2>&1 || {
+  printf '%s\n' \
+    "找不到 codex-security。安装:" \
+    "  npm install -g @openai/codex-security" \
+    "  codex-security login        # ChatGPT 登录, 走订阅" >&2
+  exit 1
+}
+
+stamp=$(date +%Y%m%dT%H%M%S)
+out="$RESULTS/$stamp"
+mkdir -p "$RESULTS"
+
+printf '%s\n' \
+  "  仓库    $PREFIX" \
+  "  结果    $out" \
+  "  成本上限 \$$MAX_COST" \
+  ""
+
+# The owner's standing rule: anything that talks to a model goes through the
+# outbound proxy. Read from runtime.json rather than assumed, so this is correct
+# on a machine that does not use one.
+proxy=$(python3 -c '
+import json, os, pathlib, sys
+p = pathlib.Path(os.environ.get("FLEET_RUNTIME_CONFIG",
+    str(pathlib.Path.home() / ".config" / "claude-fleet" / "runtime.json")))
+try:
+    print(json.loads(p.read_text(encoding="utf-8")).get("outbound_proxy") or "")
+except Exception:
+    print("")' 2>/dev/null || true)
+if [ -n "$proxy" ]; then
+  export HTTPS_PROXY="$proxy" HTTP_PROXY="$proxy"
+  printf '  出站代理 %s\n\n' "$proxy"
+fi
+
+# shellcheck disable=SC2086
+codex-security scan "$PREFIX" $MODE $DIFF $KNOWLEDGE \
+  --max-cost "$MAX_COST" --output-dir "$out"
+status=$?
+
+printf '\n'
+if [ -f "$out/coverage.json" ]; then
+  printf '  %s\n' "没扫到的部分在 $out/coverage.json —— 那份清单是要读的, 不是归档的"
+fi
+printf '  %s\n' "分诊误报: codex-security findings false-positive --reason ..."
+printf '  %s\n' "修完复验: codex-security scans compare"
+exit $status

@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""A complete second Fleet, on its own ports, with its own everything.
+
+    fleet-shadow up          start it
+    fleet-shadow status      what is running, and where
+    fleet-shadow probe       send a real authenticated request through it
+    fleet-shadow down        stop it
+    fleet-shadow logs        tail what it wrote
+
+The changes queued after this one — authentication fail-closed, the account
+identity key, crash-safe credential writes — all sit in the request path of a
+system people are actively using. "Run the tests and deploy carefully" is not a
+plan for those; the tests pass today with authentication wide open.
+
+So: bring up the whole thing somewhere else first.
+
+## What makes it isolated, and how each isolation is enforced
+
+- **Ports.** Coordinator 27891, data plane 23456. Production is 17891/13456.
+  This is only trustworthy because the port literals were unified first: doctor
+  used to fall back to 3456 while reconcile hardcoded 13456, so a check run
+  against a shadow silently reported on production — and the output looked
+  right, which is the worst way to be wrong.
+- **Database.** Its own file, created empty. Never the production path.
+- **Credentials.** A generated `teamclaude.json` with obviously fake tokens.
+  The shadow must not be able to spend a real subscription even by accident,
+  so there is no code path that copies real credentials into it.
+- **State directory.** Its own, so logs and marks cannot be confused for the
+  real ones.
+
+## What it deliberately cannot do
+
+Reach Anthropic. The credentials are fake, so any request that gets as far as
+the upstream fails there. That is the correct boundary for what this is for:
+the loopback trust boundary, the identity model, and the config writes — all of
+which are decided long before a token is used.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+REPO = Path(__file__).resolve().parent.parent
+ROOT = Path(os.environ.get(
+    "FLEET_SHADOW_ROOT",
+    str(Path.home() / ".local" / "state" / "claude-fleet" / "shadow")))
+
+COORDINATOR_PORT = int(os.environ.get("FLEET_SHADOW_COORDINATOR_PORT", "27891"))
+PROXY_PORT = int(os.environ.get("FLEET_SHADOW_PROXY_PORT", "23456"))
+
+# Long enough to be unmistakable in a log, and shaped so no real credential
+# check could ever accept it.
+SHADOW_TOKEN = "shadow-coordinator-token-not-a-credential"
+FAKE_ACCESS = "sk-ant-oat01-fleet-shadow-fake-access-not-a-credential"
+FAKE_REFRESH = "sk-ant-ort01-fleet-shadow-fake-refresh-not-a-credential"
+
+DIM, BOLD, RED, GREEN, RESET = "\033[2m", "\033[1m", "\033[31m", "\033[32m", "\033[0m"
+
+
+def say(message: str, err: bool = False) -> None:
+    print(message, file=sys.stderr if err else sys.stdout)
+
+
+def _paths() -> Dict[str, Path]:
+    return {
+        "root": ROOT,
+        "runtime": ROOT / "runtime.json",
+        "teamclaude": ROOT / "teamclaude.json",
+        "db": ROOT / "fleet.sqlite3",
+        "log": ROOT / "shadow.log",
+        "pids": ROOT / "pids.json",
+    }
+
+
+def _guard_against_production(paths: Dict[str, Path]) -> Optional[str]:
+    """The one mistake this script must never make.
+
+    A shadow that writes to the real database or the real credential file is
+    not a shadow, it is an outage with extra steps. Checked at every entry
+    point rather than trusted to the constants above staying correct.
+    """
+    real_state = Path.home() / ".local" / "state" / "claude-fleet"
+    real_config = Path.home() / ".config" / "claude-fleet"
+    for key in ("db", "runtime", "teamclaude"):
+        target = paths[key].resolve()
+        if target == (real_state / "fleet.sqlite3").resolve():
+            return "shadow db path resolves to the production database"
+        if target.parent == real_config.resolve():
+            return "shadow config would be written into the production config dir"
+    if COORDINATOR_PORT == 17891 or PROXY_PORT == 13456:
+        return "shadow ports collide with production (17891/13456)"
+    return None
+
+
+def _port_busy(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.4)
+        return sock.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _write_config(paths: Dict[str, Path]) -> None:
+    """Build the isolated config from scratch. Nothing is copied from production."""
+    paths["root"].mkdir(parents=True, exist_ok=True)
+
+    production = {}
+    try:
+        production = json.loads(
+            (Path.home() / ".config" / "claude-fleet" / "runtime.json")
+            .read_text(encoding="utf-8"))
+    except Exception:                                         # noqa: BLE001
+        pass
+
+    runtime = {
+        "version": 1,
+        "prefix": str(REPO),
+        "proxy_port": PROXY_PORT,
+        "coordinator_port": COORDINATOR_PORT,
+        "db_path": str(paths["db"]),
+        "teamclaude_config": str(paths["teamclaude"]),
+        # Borrowed because they are host facts, not fleet state: which node runs,
+        # and how this machine reaches the internet. Neither can leak the
+        # production fleet's identity or quota into the shadow.
+        "node_binary": production.get("node_binary", "node"),
+        "outbound_proxy": production.get("outbound_proxy"),
+        "no_proxy": production.get("no_proxy", "localhost,127.0.0.1,::1"),
+        "hold_seconds": 60,
+    }
+    paths["runtime"].write_text(json.dumps(runtime, indent=2), encoding="utf-8")
+    os.chmod(paths["runtime"], 0o600)
+
+    # Shape copied from the production config's own top level, not invented.
+    # Getting it wrong is silent until the data plane starts: the first attempt
+    # put the port at the top level and the server died on `config.proxy.port`
+    # with a TypeError — which is exactly the kind of thing the shadow is for
+    # catching, rather than the production restart.
+    teamclaude = {
+        "proxy": {"port": PROXY_PORT, "host": "127.0.0.1"},
+        "upstream": "https://api.anthropic.com",
+        "switchThreshold": 0.98,
+        "holdSeconds": 60,
+        "distributeSessions": False,
+        "eventLogging": "hide",
+        "autoUpdate": False,
+        # Both off. The shadow's credentials are fake, so a probe or a warmup
+        # would only generate noisy 401s against the real Anthropic endpoint.
+        "quotaProbeSeconds": 0,
+        "warmupSeconds": 0,
+        "sx": {"mode": "off"},
+        "fleetCoordinator": {
+            "enabled": True,
+            "url": "http://127.0.0.1:%d" % COORDINATOR_PORT,
+            "token": SHADOW_TOKEN,
+            "timeoutMs": 15000,
+        },
+        "accounts": [
+            {
+                "type": "oauth",
+                "name": "shadow-%s" % name,
+                "accountUuid": uuid,
+                "orgUuid": org,
+                "orgName": org_name,
+                "accessToken": FAKE_ACCESS,
+                "refreshToken": FAKE_REFRESH,
+                # Far future so nothing tries to refresh a fake credential and
+                # spends the run arguing with the OAuth endpoint.
+                "expiresAt": (time.time() + 365 * 24 * 3600) * 1000,
+            }
+            # Two accounts sharing one accountUuid across two orgs: the exact
+            # shape the identity change has to get right, and impossible to
+            # rehearse on production without a second real subscription.
+            for name, uuid, org, org_name in (
+                ("alpha", "00000000-0000-4000-8000-00000000a001",
+                 "00000000-0000-4000-8000-0000000000b1", "Shadow Personal"),
+                ("beta", "00000000-0000-4000-8000-00000000a002",
+                 "00000000-0000-4000-8000-0000000000b2", "Shadow Corp"),
+                ("twin", "00000000-0000-4000-8000-00000000a002",
+                 "00000000-0000-4000-8000-0000000000b3", "Shadow Other Org"),
+            )
+        ],
+    }
+    paths["teamclaude"].write_text(json.dumps(teamclaude, indent=2), encoding="utf-8")
+    os.chmod(paths["teamclaude"], 0o600)
+
+
+def _env(paths: Dict[str, Path]) -> Dict[str, str]:
+    env = dict(os.environ)
+    env["FLEET_RUNTIME_CONFIG"] = str(paths["runtime"])
+    env["FLEET_DB"] = str(paths["db"])
+    env["TEAMCLAUDE_CONFIG"] = str(paths["teamclaude"])
+    env["FLEET_COORDINATOR_TOKEN"] = SHADOW_TOKEN
+    env["FLEET_COORDINATOR_PORT"] = str(COORDINATOR_PORT)
+    env["PYTHONPATH"] = str(REPO / "src") + os.pathsep + env.get("PYTHONPATH", "")
+    return env
+
+
+def cmd_up() -> int:
+    paths = _paths()
+    problem = _guard_against_production(paths)
+    if problem:
+        say("%s拒绝启动：%s%s" % (RED, problem, RESET), err=True)
+        return 2
+
+    for name, port in (("协调器", COORDINATOR_PORT), ("数据面", PROXY_PORT)):
+        if _port_busy(port):
+            say("%s%s 的端口 %d 已被占用 —— 先 `fleet-shadow down`%s"
+                % (RED, name, port, RESET), err=True)
+            return 1
+
+    _write_config(paths)
+    say("  配置已写到 %s" % paths["root"])
+
+    env = _env(paths)
+    log = paths["log"].open("ab")
+    pids = {}
+
+    coordinator = subprocess.Popen(
+        [sys.executable, "-m", "claude_fleet.cli", "--db", str(paths["db"]),
+         "coordinator", "--port", str(COORDINATOR_PORT)],
+        cwd=str(REPO), env=env, stdout=log, stderr=log, start_new_session=True)
+    pids["coordinator"] = coordinator.pid
+
+    deadline = time.time() + 15
+    while time.time() < deadline and not _port_busy(COORDINATOR_PORT):
+        if coordinator.poll() is not None:
+            say("%s协调器启动即退出，看 `fleet-shadow logs`%s" % (RED, RESET), err=True)
+            return 1
+        time.sleep(0.2)
+
+    paths["pids"].write_text(json.dumps(pids), encoding="utf-8")
+    say("  %s协调器%s  127.0.0.1:%d  pid %d"
+        % (GREEN, RESET, COORDINATOR_PORT, coordinator.pid))
+    say("  %s数据面尚未启动 —— 它需要 CA 与 node，按需再加%s" % (DIM, RESET))
+    say("\n  验证：fleet-shadow probe")
+    return 0
+
+
+def cmd_probe() -> int:
+    """A real authenticated request, over a real socket, against the shadow."""
+    import urllib.error
+    import urllib.request
+
+    paths = _paths()
+    if not paths["teamclaude"].exists():
+        say("影子还没起过。先 `fleet-shadow up`。", err=True)
+        return 1
+    config = json.loads(paths["teamclaude"].read_text(encoding="utf-8"))
+    account = config["accounts"][0]["accountUuid"]
+
+    results = []
+    for label, token in (("正确令牌", SHADOW_TOKEN),
+                         ("错误令牌", "wrong"),
+                         ("不带令牌", None)):
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = "Bearer %s" % token
+        request = urllib.request.Request(
+            "http://127.0.0.1:%d/v1/pin/check" % COORDINATOR_PORT,
+            data=json.dumps({"account_id": account}).encode("utf-8"),
+            method="POST", headers=headers)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            with opener.open(request, timeout=8) as response:
+                code = response.status
+        except urllib.error.HTTPError as exc:
+            code = exc.code
+        except Exception as exc:                              # noqa: BLE001
+            say("  %-10s → 连不上：%s" % (label, str(exc)[:60]), err=True)
+            return 1
+        results.append((label, code))
+        say("  %-10s → HTTP %s" % (label, code))
+
+    correct = dict(results)["正确令牌"]
+    rejected = [code for label, code in results if label != "正确令牌"]
+    if correct == 401:
+        say("%s  正确令牌也被拒 —— 鉴权坏了%s" % (RED, RESET), err=True)
+        return 1
+    if any(code != 401 for code in rejected):
+        say("%s  错误/缺失令牌没有被拒 —— 鉴权是敞开的%s" % (RED, RESET), err=True)
+        return 1
+    say("\n  %s鉴权行为正确%s" % (GREEN, RESET))
+    return 0
+
+
+def cmd_status() -> int:
+    paths = _paths()
+    say("  根目录   %s" % paths["root"])
+    say("  协调器   127.0.0.1:%d  %s"
+        % (COORDINATOR_PORT, "在跑" if _port_busy(COORDINATOR_PORT) else "没起"))
+    say("  数据面   127.0.0.1:%d  %s"
+        % (PROXY_PORT, "在跑" if _port_busy(PROXY_PORT) else "没起"))
+    say("  %s生产在 17891/13456，与此无关%s" % (DIM, RESET))
+    return 0
+
+
+def cmd_down() -> int:
+    paths = _paths()
+    if not paths["pids"].exists():
+        say("  没有记录在案的影子进程")
+        return 0
+    pids = json.loads(paths["pids"].read_text(encoding="utf-8"))
+    for name, pid in pids.items():
+        try:
+            os.kill(pid, signal.SIGTERM)
+            say("  已停 %s (pid %d)" % (name, pid))
+        except ProcessLookupError:
+            say("  %s (pid %d) 已经不在了" % (name, pid))
+    paths["pids"].unlink()
+    return 0
+
+
+def cmd_logs() -> int:
+    paths = _paths()
+    if not paths["log"].exists():
+        say("  还没有日志")
+        return 0
+    text = paths["log"].read_text(encoding="utf-8", errors="replace")
+    say("\n".join(text.splitlines()[-40:]))
+    return 0
+
+
+def main(argv: Optional[Any] = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="fleet-shadow",
+        description="在独立端口、独立数据库、假凭据上跑一整套 Fleet。")
+    parser.add_argument("command",
+                        choices=["up", "down", "status", "probe", "logs"])
+    args = parser.parse_args(argv)
+    return {
+        "up": cmd_up, "down": cmd_down, "status": cmd_status,
+        "probe": cmd_probe, "logs": cmd_logs,
+    }[args.command]()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

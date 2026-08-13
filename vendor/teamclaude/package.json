@@ -1,0 +1,40 @@
+{
+  "name": "@claude-fleet/teamclaude-dataplane",
+  "version": "1.1.11-fleet.3",
+  "description": "Controlled local Claude Fleet data plane, forked from TeamClaude 1.1.11",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "teamclaude": "src/index.js"
+  },
+  "files": [
+    "src/"
+  ],
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test",
+    "lint": "eslint ."
+  },
+  "keywords": [
+    "claude",
+    "anthropic",
+    "proxy",
+    "load-balancer",
+    "multi-account"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KarpelesLab/teamclaude.git"
+  },
+  "bugs": {
+    "url": "https://github.com/KarpelesLab/teamclaude/issues"
+  },
+  "homepage": "https://github.com/KarpelesLab/teamclaude#readme",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "devDependencies": {
+    "eslint": "^9.0.0"
+  }
+}

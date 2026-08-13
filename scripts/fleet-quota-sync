@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+"""Carry the freshest quota reading of a subscription to the host that lacks it.
+
+    fleet-quota-sync                 sync with the configured peer
+    fleet-quota-sync --dry-run       say what it would do, change nothing
+    fleet-quota-sync --peer HOST     ssh target (default: FLEET_PEER or peer-host)
+
+## Why this exists
+
+A quota window belongs to the SUBSCRIPTION, not to the host. Both hosts spend
+from one bucket, so the freshest reading anywhere is the best estimate
+everywhere. Nothing carried it across, and one host got stuck.
+
+Measured on the server: `085a6c9c` read weekly_used=1.0 with a reset 105 hours
+in the past, while the Mac read the same subscription at 0.39 with 63 hours
+left. The server had made 674 routing decisions in seven days and sent zero of
+them to that account — it has never routed there at all.
+
+That is a deadlock, not a delay. Readings arrive on the response of a real
+request; the account looks spent, so nothing is routed to it; nothing is
+routed to it, so no reading arrives. `expire_stale_windows` cannot break it
+either: it skips shared accounts on purpose, because zeroing one would be
+assuming the other party had not touched the new window.
+
+But the Mac had MEASURED that window minutes earlier. The question was never
+"should we spend a request against someone else's share" — the answer already
+existed on the other host.
+
+## What it will not do
+
+- Invent a reading. It only copies one that a data plane actually produced.
+- Move a reading backwards. The receiving row keeps whichever is newer.
+- Match by name. Only the account id, which is the subscription's identity on
+  both hosts; the display names differ (`max-b` there, `hi@…` here) and
+  matching on them is how ghost rows have twice looked legitimate.
+- Touch an account only one host knows about.
+
+## Why a reading may be copied at all
+
+The values it copies — weekly used and reset, five-hour used and reset — are
+properties of the subscription, identical for every host that holds its
+credentials. What is host-specific is which accounts a host can EXECUTE, and
+that is decided separately, from the data plane's own account list, on every
+routing decision.
+"""
+
+from __future__ import annotations
+
+
+def _peer_host() -> str:
+    """The other host, from config rather than a literal.
+
+    It used to be a hardcoded hostname, which is both un-publishable and wrong
+    for anyone else's fleet: they would have to edit source to use their own
+    machine. runtime.json already carries this host's identity; the peer belongs
+    next to it.
+    """
+    if os.environ.get("FLEET_PEER"):
+        return os.environ["FLEET_PEER"]
+    try:
+        import json as _json
+        runtime = _json.loads(
+            (pathlib.Path(os.environ.get(
+                "FLEET_RUNTIME_CONFIG",
+                str(pathlib.Path.home() / ".config" / "claude-fleet" / "runtime.json"))
+            )).read_text(encoding="utf-8"))
+        return str(runtime.get("peer_host") or "")
+    except Exception:                                         # noqa: BLE001
+        return ""
+
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+import pathlib
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+# Below this, the two hosts are telling the same story and copying gains
+# nothing but a write. Readings arrive roughly per request, so a few minutes of
+# skew is the normal state of a healthy pair.
+MIN_AGE_GAP_SECONDS = 5 * 60
+
+# A reading this old is not worth propagating even if the peer's is older
+# still: it describes a window that may itself have rolled over. Better to
+# leave the receiver visibly stale — reconcile reports that — than to give it a
+# fresh-looking timestamp on an ancient number, which is the exact defect that
+# hid the server's shared account for four days.
+MAX_USEFUL_AGE_SECONDS = 6 * 3600
+
+READ_SNIPPET = r"""
+import sqlite3, json, os
+cfg = json.load(open(os.path.expanduser("~/.config/claude-fleet/runtime.json")))
+# Self-contained on purpose: this runs as `python3 -` on either host, with no
+# package on the path. `mode=ro` cannot create the -shm or run WAL recovery, so
+# it fails intermittently with "unable to open database file" — 8% of runs.
+# Ask for read-only, fall back rather than fail.
+try:
+    db = sqlite3.connect("file:%s?mode=ro" % cfg["db_path"], uri=True, timeout=10)
+    db.execute("SELECT 1").fetchone()
+except sqlite3.OperationalError:
+    db = sqlite3.connect(cfg["db_path"], timeout=10)
+db.row_factory = sqlite3.Row
+out = {}
+for r in db.execute("SELECT id,kind,state,five_hour_used,five_hour_reset_at,"
+                    "weekly_used,weekly_reset_at,quota_updated_at,metadata "
+                    "FROM accounts"):
+    meta = json.loads(r["metadata"] or "{}")
+    out[r["id"]] = {
+        "name": meta.get("runtime_name") or r["id"],
+        "kind": r["kind"], "state": r["state"],
+        "five_hour_used": r["five_hour_used"],
+        "five_hour_reset_at": r["five_hour_reset_at"],
+        "weekly_used": r["weekly_used"],
+        "weekly_reset_at": r["weekly_reset_at"],
+        "quota_updated_at": r["quota_updated_at"],
+        "disabled": bool(meta.get("runtime_disabled")),
+    }
+print(json.dumps(out))
+"""
+
+WRITE_SNIPPET = r"""
+import sys, json, os
+sys.path.insert(0, os.path.expanduser("~/.local/share/claude-fleet/src"))
+from claude_fleet.db import FleetDB
+from claude_fleet.control import FleetControl
+cfg = json.load(open(os.path.expanduser("~/.config/claude-fleet/runtime.json")))
+control = FleetControl(FleetDB(cfg["db_path"]))
+applied = []
+for item in json.loads(sys.stdin.read()):
+    result = control.report_quota(
+        item["account_id"],
+        five_hour_used=item["five_hour_used"],
+        five_hour_reset_at=item["five_hour_reset_at"],
+        weekly_used=item["weekly_used"],
+        weekly_reset_at=item["weekly_reset_at"],
+        # The source host's clock, not this one's. A reading carried across is
+        # exactly as old as when it was taken; stamping arrival time would make
+        # the receiving row claim a freshness it does not have, and every
+        # staleness check downstream would believe it.
+        observed_at=item["observed_at"],
+    )
+    if result.get("applied") is not False:
+        applied.append(item["account_id"])
+print(json.dumps(applied))
+"""
+
+
+# A read-only connection to a WAL database needs the -shm file, and there is a
+# moment during a coordinator restart when it is being recreated: the read fails
+# with "unable to open database file" and succeeds a second later. Seen once
+# while building this. Unretried, that turns into a scheduled job that fails at
+# random and teaches whoever reads the log to ignore it.
+READ_ATTEMPTS = 3
+READ_BACKOFF_SECONDS = 2.0
+
+
+def _with_retry(what: str, call):
+    last = None
+    for attempt in range(READ_ATTEMPTS):
+        try:
+            return call()
+        except Exception as exc:
+            last = exc
+            if attempt + 1 < READ_ATTEMPTS:
+                time.sleep(READ_BACKOFF_SECONDS)
+    raise RuntimeError("%s failed after %d attempts: %s"
+                       % (what, READ_ATTEMPTS, str(last)[-300:]))
+
+
+def _local_accounts() -> Dict[str, Any]:
+    def once():
+        result = subprocess.run([sys.executable, "-c", READ_SNIPPET],
+                                capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr[-300:])
+        return json.loads(result.stdout)
+    return _with_retry("local read", once)
+
+
+def _ssh(peer: str, command: str, stdin: str, what: str) -> str:
+    result = subprocess.run(
+        ["ssh", "-o", "ConnectTimeout=10", peer, command],
+        input=stdin, capture_output=True, text=True, timeout=120,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("%s failed on %s: %s"
+                           % (what, peer, result.stderr.strip()[-300:]))
+    return result.stdout
+
+
+def _remote_read(peer: str) -> Dict[str, Any]:
+    return _with_retry("remote read", lambda: json.loads(
+        _ssh(peer, "HOME=/home/nature python3 -", READ_SNIPPET, "read") or "{}"))
+
+
+def _remote_write(peer: str, moves: list) -> list:
+    """Two hops on purpose: the writer script goes over first, then the data.
+
+    `python3 -` reads the PROGRAM from stdin, so it cannot also read the moves
+    from there. Sending the script to a file and piping the payload into it
+    keeps both as stdin-safe JSON instead of interpolating account values into
+    a shell command.
+    """
+    _ssh(peer, "cat > /tmp/fleet-quota-apply.py", WRITE_SNIPPET, "stage writer")
+    return json.loads(_ssh(peer, "HOME=/home/nature python3 /tmp/fleet-quota-apply.py",
+                           json.dumps(moves), "write") or "[]")
+
+
+def _plan(source: Dict[str, Any], target: Dict[str, Any],
+          now: float) -> list:
+    """Which of `target`'s rows should take `source`'s reading."""
+    moves = []
+    for account_id, src in source.items():
+        dst = target.get(account_id)
+        if dst is None:
+            # An account only one host knows. Copying a reading to a row that
+            # does not exist would CREATE it, and an account row the local data
+            # plane cannot execute is the shape that has 502'd this fleet.
+            continue
+        if src["quota_updated_at"] is None:
+            continue
+        if src["weekly_used"] is None and src["five_hour_used"] is None:
+            continue
+        src_age = now - src["quota_updated_at"]
+        if src_age > MAX_USEFUL_AGE_SECONDS:
+            continue
+        dst_stamp = dst["quota_updated_at"]
+        if dst_stamp is not None and dst_stamp >= src["quota_updated_at"]:
+            continue
+        gap = src["quota_updated_at"] - (dst_stamp or 0)
+        if dst_stamp is not None and gap < MIN_AGE_GAP_SECONDS:
+            continue
+        moves.append({
+            "account_id": account_id,
+            "name": dst["name"],
+            "kind": dst["kind"],
+            "source_age_minutes": round(src_age / 60, 1),
+            "target_age_hours": (None if dst_stamp is None
+                                 else round((now - dst_stamp) / 3600, 1)),
+            "was": {"weekly_used": dst["weekly_used"],
+                    "weekly_reset_in_hours": (
+                        None if dst["weekly_reset_at"] is None
+                        else round((dst["weekly_reset_at"] - now) / 3600, 1))},
+            "becomes": {"weekly_used": src["weekly_used"],
+                        "weekly_reset_in_hours": (
+                            None if src["weekly_reset_at"] is None
+                            else round((src["weekly_reset_at"] - now) / 3600, 1))},
+            "five_hour_used": src["five_hour_used"],
+            "five_hour_reset_at": src["five_hour_reset_at"],
+            "weekly_used": src["weekly_used"],
+            "weekly_reset_at": src["weekly_reset_at"],
+            "observed_at": src["quota_updated_at"],
+        })
+    return moves
+
+
+def _describe(moves: list, direction: str) -> None:
+    if not moves:
+        print("  %s: 无需同步" % direction)
+        return
+    print("  %s: %d 个账号" % (direction, len(moves)))
+    for m in moves:
+        print("    %-24s %-7s 读数 %s → %.1f 分钟前" % (
+            m["name"][:24], m["kind"],
+            "从未" if m["target_age_hours"] is None
+            else "%.1fh前" % m["target_age_hours"],
+            m["source_age_minutes"]))
+        print("        周额度 %s (重置 %sh) → %s (重置 %sh)" % (
+            m["was"]["weekly_used"], m["was"]["weekly_reset_in_hours"],
+            m["becomes"]["weekly_used"], m["becomes"]["weekly_reset_in_hours"]))
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        description="carry the freshest quota reading to the host that lacks it")
+    parser.add_argument("--peer", default=_peer_host())
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+
+    now = time.time()
+    local = _local_accounts()
+    try:
+        remote = _remote_read(args.peer)
+    except Exception as exc:
+        # Unreachable is not a failure to sync — it is no information. Exit 2
+        # so a caller can tell "the peer is down" from "the sync went wrong".
+        print("对端不可达：%s" % str(exc)[-200:], file=sys.stderr)
+        return 2
+
+    to_remote = _plan(local, remote, now)
+    to_local = _plan(remote, local, now)
+
+    if args.json:
+        print(json.dumps({"to_remote": to_remote, "to_local": to_local},
+                         ensure_ascii=False, indent=2))
+        return 0
+
+    print("本机 %d 个账号，%s %d 个" % (len(local), args.peer, len(remote)))
+    _describe(to_remote, "本机 → %s" % args.peer)
+    _describe(to_local, "%s → 本机" % args.peer)
+
+    if args.dry_run:
+        print("  （干跑，未改动）")
+        return 0
+
+    if to_remote:
+        try:
+            applied = _remote_write(args.peer, to_remote)
+        except Exception as exc:
+            print("写入 %s 失败：%s" % (args.peer, str(exc)[-300:]), file=sys.stderr)
+            return 1
+        print("  已写入 %s：%d 个" % (args.peer, len(applied)))
+
+    if to_local:
+        result = subprocess.run([sys.executable, "-c", WRITE_SNIPPET],
+                                input=json.dumps(to_local),
+                                capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            print("本机写入失败：%s" % result.stderr[-300:], file=sys.stderr)
+            return 1
+        print("  已写入本机：%d 个" % len(json.loads(result.stdout)))
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

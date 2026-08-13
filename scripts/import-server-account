@@ -1,0 +1,125 @@
+#!/bin/sh
+# Import a setup-token into the server's Fleet data plane, then verify it.
+#
+# Why setup-tokens and not a copy of the Mac's OAuth credentials: refresh tokens
+# rotate (`oauth.js:116` is `data.refresh_token || refreshToken`), so two hosts
+# holding the same OAuth family knock each other out — primary-current is in
+# exactly that state right now. A setup-token is a separate authorization for
+# the same account, and the server's three existing ones have coexisted with the
+# Mac's OAuth for a week with zero invalid_grant.
+#
+# What this fixes: the server's data plane can only execute accounts it holds
+# credentials for. `fleet-coordinator.js:242` looks the coordinator's chosen
+# account_id up in its OWN accountManager and throws "selected unknown account"
+# otherwise. So hey@ and hello@ headroom is unreachable from the server until
+# their credentials exist there. See CROSS-HOST-AUDIT-001.md.
+#
+# Usage, on the SERVER as user nature:
+#
+#   claude-real setup-token              # log in as hey@, copy the token
+#   umask 077
+#   cat > ~/.config/claude-fleet/setup-tokens/hey.token    # paste, then Ctrl-D
+#   import-server-account hey  00000000-0000-4000-8000-000000000003 \
+#                              ~/.config/claude-fleet/setup-tokens/hey.token
+#
+# The account NAME is cosmetic; the UUID is what makes both hosts agree on one
+# identity, and it is verified against the weekly-reset fingerprint before the
+# import is kept.
+
+set -eu
+
+NAME=${1:-}
+UUID=${2:-}
+TOKEN_FILE=${3:-}
+
+if [ -z "$NAME" ] || [ -z "$UUID" ] || [ -z "$TOKEN_FILE" ]; then
+  cat >&2 <<'EOF'
+usage: import-server-account <name> <account-uuid> <token-file>
+
+  name        account name in teamclaude.json (e.g. hey)
+  uuid        the account's real UUID, so both hosts agree on one identity
+  token-file  file holding the setup-token, mode 0600, owned by you
+
+Known UUIDs (from the Mac, matched by weekly-reset fingerprint):
+  second@example.com    00000000-0000-4000-8000-000000000003
+  third@example.com  00000000-0000-4000-8000-000000000004
+EOF
+  exit 64
+fi
+
+FLEET=${FLEET_BINARY:-"$HOME/.local/bin/fleet"}
+CONFIG=${TEAMCLAUDE_CONFIG:-"$HOME/.config/claude-fleet/teamclaude.json"}
+DB=${FLEET_DB:-"$HOME/.local/state/claude-fleet/fleet.sqlite3"}
+
+[ -f "$TOKEN_FILE" ] || { printf '%s\n' "no such token file: $TOKEN_FILE" >&2; exit 66; }
+[ -s "$TOKEN_FILE" ] || { printf '%s\n' "token file is empty: $TOKEN_FILE" >&2; exit 66; }
+
+# The importer enforces these too, but failing here gives a clearer message than
+# a traceback from inside the CLI.
+MODE=$(stat -c '%a' "$TOKEN_FILE" 2>/dev/null || stat -f '%Lp' "$TOKEN_FILE")
+case "$MODE" in
+  *[1-7][0-7]|*[0-7][1-7]) printf '%s\n' "token file must be 0600 (is $MODE): chmod 600 $TOKEN_FILE" >&2; exit 77 ;;
+esac
+
+BACKUP="$CONFIG.before-import-$NAME-$(date +%Y%m%dT%H%M%S)"
+cp "$CONFIG" "$BACKUP"
+printf 'config backed up: %s\n' "$BACKUP"
+
+printf '\n== importing %s ==\n' "$NAME"
+"$FLEET" import-setup-token "$NAME" --from-file "$TOKEN_FILE"
+
+# The importer does not know the account's UUID. Without it the data plane
+# reports the account as its NAME, and the two hosts would then disagree about
+# identity for the same subscription — the exact double-identity problem the
+# audit flagged.
+printf '\n== stamping accountUuid ==\n'
+python3 - "$CONFIG" "$NAME" "$UUID" <<'PY'
+import json, os, sys, tempfile
+config, name, uuid_value = sys.argv[1], sys.argv[2], sys.argv[3]
+data = json.load(open(config))
+hits = [a for a in data.get("accounts", []) if a.get("name") == name]
+if len(hits) != 1:
+    sys.exit(f"expected exactly one account named {name!r}, found {len(hits)}")
+hits[0]["accountUuid"] = uuid_value
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(config))
+with os.fdopen(fd, "w") as handle:
+    json.dump(data, handle, indent=2, ensure_ascii=False)
+os.chmod(tmp, 0o600)
+os.replace(tmp, config)
+print(f"  {name} -> {uuid_value}")
+PY
+
+printf '\n== restarting data plane ==\n'
+if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet claude-fleet-dataplane 2>/dev/null; then
+  sudo systemctl restart claude-fleet-dataplane
+  sleep 5
+else
+  printf '  not systemd-managed here; restart the data plane yourself\n'
+fi
+
+printf '\n== verifying ==\n'
+printf 'the account must appear in the data plane pool:\n'
+# Deliberately not an f-string with quotes inside: this whole block is already
+# inside a shell single-quoted heredoc, and the nested escaping produced a
+# SyntaxError that hid the verification output entirely.
+curl -s --noproxy '*' --max-time 8 http://127.0.0.1:13456/teamclaude/status \
+  | python3 -c '
+import json, sys
+status = json.load(sys.stdin)
+for account in status.get("accounts", []):
+    name = account.get("name")
+    state = account.get("status")
+    print("  %-10s status=%s" % (name, state))
+'
+
+cat <<EOF
+
+Next: send one real request so the coordinator records the account, then check
+the fingerprint agrees with the Mac's row for the same UUID:
+
+  cd /tmp && claude -p 'say IMPORT_OK'
+  $FLEET --db $DB account list
+
+A weekly_reset_at that does NOT match the Mac's value for $UUID means the UUID
+is wrong — restore $BACKUP and stop.
+EOF

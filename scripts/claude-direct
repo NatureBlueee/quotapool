@@ -1,0 +1,491 @@
+#!/usr/bin/env python3
+"""Start Claude Code on one named account, with Fleet entirely out of the way.
+
+    claude-direct                      list accounts, pick one
+    claude-direct hey@                 use that account
+    claude-direct --account <uuid>     pick by uuid (same email, two orgs)
+    claude-direct --binary <path>      pin a Claude Code version
+    claude-direct -- --resume <id>     everything after `--` goes to Claude
+
+This is two things at once, and both matter.
+
+## 1. The escape hatch
+
+`claude` is a symlink to `claude-fleet-shell`, which is `exec fleet run`. So a
+broken Fleet does not degrade to a slower Claude — it takes `claude` with it,
+and the tool you would use to diagnose the breakage is the thing that broke.
+That is the failure the owner described as "改了就全坏, 坏了又因为坏了没法修".
+
+So this file has ONE hard rule, and every design decision below follows from it:
+
+    IT MUST NOT IMPORT ANYTHING FROM claude_fleet.
+
+No control plane, no coordinator, no SQLite, no data plane. It reads one JSON
+file with the standard library and execs a binary. If Fleet is a smoking hole,
+this still works, because there is nothing of Fleet in its path.
+
+## 2. The manual override
+
+The same mechanism answers "I want THIS account, right now, no scheduler". That
+is the strongest form of the manual control the owner asked for: not a hint to
+the optimizer, but a bypass.
+
+## What it deliberately will not do
+
+- **Refresh when Fleet might also be refreshing.** OAuth refresh tokens are
+  single-use: refreshing rotates the token and voids the old one. Two refreshers
+  racing produce exactly `invalid_grant: Refresh token not found or invalid` —
+  which is what put 588 false "needs re-login" lines in this machine's log
+  between 08-06 and 08-09, and retired four accounts from rotation. So: if the
+  stored token is still valid, this never refreshes. If it is expired and the
+  data plane is listening, it says so and stops rather than joining the race.
+- **Route through Fleet.** It clears the variables that would send the request
+  back into the data plane. It leaves the *outbound* proxy alone — that is the
+  owner's network policy, not Fleet's plumbing, and it applies here too.
+- **Pretend it is Fleet.** No quota accounting, no reserve floors, no rotation.
+  When this account's window runs out you get an error, not a wait. Say so.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import socket
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+# Same endpoint and client the data plane uses (vendor/teamclaude/src/oauth.js
+# lines 60-61 and 85-95). Duplicated on purpose: importing them would reintroduce
+# the dependency this file exists to avoid.
+TOKEN_ENDPOINT = "https://platform.claude.com/v1/oauth/token"
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+
+CONFIG = Path(
+    os.environ.get("TEAMCLAUDE_CONFIG")
+    or Path.home() / ".config" / "claude-fleet" / "teamclaude.json"
+)
+VERSIONS_DIR = Path.home() / ".local" / "share" / "claude" / "versions"
+
+# Refresh a little before the wire expiry so a long session does not die one
+# minute in. The data plane uses the same idea; the number is ours.
+EXPIRY_SKEW_SECONDS = 300
+
+# Variables that would put the request back through Fleet. ANTHROPIC_BASE_URL
+# and the Fleet CA are the direct routes; the *_PROXY pair is only cleared when
+# it points at the data plane, because the owner's rule is that all AI traffic
+# goes through the outbound proxy and that still holds here.
+FLEET_ONLY_ENV = (
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "NODE_EXTRA_CA_CERTS",
+    "TC_ACCT",
+    "FLEET_LAUNCH_ID",
+    "FLEET_SESSION_ID",
+    "CLAUDE_CODE_OAUTH_SCOPES",
+)
+
+DIM = "\033[2m"
+BOLD = "\033[1m"
+YELLOW = "\033[33m"
+RED = "\033[31m"
+RESET = "\033[0m"
+
+
+def _warn(message: str) -> None:
+    sys.stderr.write("%s%s%s\n" % (YELLOW, message, RESET))
+
+
+def _die(message: str, code: int = 1) -> "NoReturn":  # type: ignore[valid-type]
+    sys.stderr.write("%s%s%s\n" % (RED, message, RESET))
+    raise SystemExit(code)
+
+
+# --------------------------------------------------------------------------
+# accounts
+# --------------------------------------------------------------------------
+
+def _load_config() -> Dict[str, Any]:
+    try:
+        return json.loads(CONFIG.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        _die("找不到账号配置: %s\n"
+             "如果 Fleet 从未安装过, 直接用原生 claude 即可。" % CONFIG)
+    except json.JSONDecodeError as exc:
+        # A truncated config is the exact failure mode that makes an escape
+        # hatch necessary, so name it instead of dying with a stack trace.
+        _die("账号配置不是合法 JSON (%s): %s\n"
+             "文件可能在写入中途被中断。同目录下找 *.bak 或用 fleet restore。"
+             % (exc, CONFIG))
+
+
+def _accounts(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [a for a in config.get("accounts", [])
+            if isinstance(a, dict) and a.get("type") == "oauth"]
+
+
+def _expires_at(account: Dict[str, Any]) -> Optional[float]:
+    raw = account.get("expiresAt")
+    if not isinstance(raw, (int, float)):
+        return None
+    # Stored in milliseconds by the data plane; tolerate seconds.
+    return float(raw) / 1000.0 if raw > 1e11 else float(raw)
+
+
+def _token_state(account: Dict[str, Any], now: float) -> str:
+    if not account.get("accessToken"):
+        return "无令牌"
+    expiry = _expires_at(account)
+    if expiry is None:
+        return "有效期未知"
+    remaining = expiry - now
+    if remaining > EXPIRY_SKEW_SECONDS:
+        return "有效 %s" % _duration(remaining)
+    return "已过期 %s" % _duration(-remaining)
+
+
+def _duration(seconds: float) -> str:
+    seconds = abs(int(seconds))
+    if seconds >= 86400:
+        return "%dd%dh" % (seconds // 86400, (seconds % 86400) // 3600)
+    if seconds >= 3600:
+        return "%dh%dm" % (seconds // 3600, (seconds % 3600) // 60)
+    return "%dm" % max(1, seconds // 60)
+
+
+def _label(account: Dict[str, Any]) -> str:
+    """Name, plus the org only when the org actually distinguishes anything.
+
+    One email can hold accounts in several orgs, and there the org is the only
+    thing telling them apart. But a personal subscription's org is named
+    "<email>'s Organization", which repeats the name back at twice the width and
+    pushes every other column off the screen. Show it when it carries
+    information, drop it when it does not.
+    """
+    name = str(account.get("name") or account.get("accountUuid") or "?")
+    org = str(account.get("orgName") or "")
+    if not org or org.startswith(name):
+        return name
+    return "%s (%s)" % (name, org)
+
+
+def _select(accounts: List[Dict[str, Any]], query: Optional[str],
+            uuid: Optional[str]) -> Dict[str, Any]:
+    if uuid:
+        exact = [a for a in accounts if a.get("accountUuid") == uuid]
+        if not exact:
+            _die("没有 accountUuid 为 %s 的账号" % uuid)
+        return exact[0]
+
+    if query:
+        # Match the name OR a uuid prefix. `--list` prints uuids, so pasting one
+        # back as the positional argument is the natural move — and it failing
+        # with "no name matches" would be the tool blaming the user for doing
+        # exactly what its own output invited.
+        needle = query.lower()
+        hits = [a for a in accounts
+                if needle in str(a.get("name") or "").lower()
+                or str(a.get("accountUuid") or "").lower().startswith(needle)]
+        if not hits:
+            _die("没有名字或 uuid 匹配 %r 的账号。不带参数运行可以看全部。" % query)
+        if len(hits) > 1:
+            lines = "\n".join(
+                "  %s  --account %s" % (_label(a), a.get("accountUuid") or "?")
+                for a in hits)
+            _die("%r 匹配到多个账号, 用 --account 指定:\n%s" % (query, lines))
+        return hits[0]
+
+    return _prompt(accounts)
+
+
+def _prompt(accounts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not sys.stdin.isatty():
+        _die("没有指定账号, 而且不是交互式终端。用 claude-direct <名字> 指定。")
+
+    now = time.time()
+    sys.stderr.write("\n%s选一个账号直连%s %s(绕过 Fleet 调度)%s\n\n"
+                     % (BOLD, RESET, DIM, RESET))
+    for index, account in enumerate(accounts, 1):
+        flags = []
+        if account.get("disabled"):
+            flags.append("已停用")
+        if account.get("status") == "error":
+            flags.append("凭据失效")
+        suffix = (" %s· %s%s" % (DIM, " · ".join(flags), RESET)) if flags else ""
+        sys.stderr.write("  %d) %-34s %s%s%s%s\n" % (
+            index, _label(account), DIM, _token_state(account, now), RESET,
+            suffix))
+    sys.stderr.write("\n序号: ")
+    sys.stderr.flush()
+
+    try:
+        choice = int(sys.stdin.readline().strip())
+    except (ValueError, KeyboardInterrupt):
+        _die("\n取消。")
+    if not 1 <= choice <= len(accounts):
+        _die("序号超出范围。")
+    return accounts[choice - 1]
+
+
+# --------------------------------------------------------------------------
+# token
+# --------------------------------------------------------------------------
+
+def _dataplane_listening(port: int = 13456) -> bool:
+    """Is the data plane up? This decides whether refreshing here is safe.
+
+    Deliberately a raw socket probe rather than an HTTP request: this must work
+    when the data plane is running but wedged, and it must not depend on any
+    Fleet code path being intact.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.4)
+        return sock.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _refresh(refresh_token: str, timeout: float = 20.0) -> Dict[str, Any]:
+    body = json.dumps({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": CLIENT_ID,
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        TOKEN_ENDPOINT, data=body, method="POST",
+        headers={"Content-Type": "application/json",
+                 "Accept": "application/json, text/plain, */*"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:200]
+        if exc.code in (400, 401, 403):
+            _die("这个账号的 refresh token 被拒绝 (%d): %s\n"
+                 "需要重新登录: fleet login" % (exc.code, detail))
+        _die("刷新令牌失败 (%d): %s" % (exc.code, detail))
+    except urllib.error.URLError as exc:
+        _die("刷新令牌时网络不通: %s\n"
+             "如果配了出站代理, 确认它还活着。" % exc.reason)
+
+    expires_at = data.get("expires_at")
+    if not isinstance(expires_at, (int, float)):
+        expires_at = (time.time() + float(data.get("expires_in") or 3600)) * 1000
+    return {
+        "accessToken": data["access_token"],
+        # The endpoint may or may not rotate the refresh token. Keeping the old
+        # one when none is returned matches the data plane (oauth.js:116).
+        "refreshToken": data.get("refresh_token") or refresh_token,
+        "expiresAt": expires_at,
+    }
+
+
+def _write_back(account_uuid: str, tokens: Dict[str, Any]) -> None:
+    """Persist rotated credentials, atomically, under a lock.
+
+    Two separate hazards, and the file has historically been exposed to both:
+
+    1. A torn write. `saveConfig` in the vendored data plane writes this file
+       with a plain `writeFile`, so a process killed mid-write truncates every
+       account's credentials at once. Temp file + fsync + rename cannot tear.
+    2. A lost update. The lock serialises other copies of this tool. It does NOT
+       serialise against the Node data plane, which takes no such lock — which
+       is why the caller refuses to refresh at all while the data plane is up,
+       rather than relying on this.
+    """
+    # O_EXCL rather than flock, because the data plane has to be able to take
+    # the SAME lock and it is a dependency-free Node process — Node has no
+    # binding for flock, so an flock here and an O_EXCL lockfile there would be
+    # two locks that cannot see each other, which is worse than one lock nobody
+    # takes. `config.js:withConfigLock` is the other half of this.
+    lock_path = Path(str(CONFIG) + ".lock")
+    deadline = time.time() + 3.0
+    lock_fd = None
+    while time.time() < deadline:
+        try:
+            lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.write(lock_fd, str(os.getpid()).encode("ascii"))
+            break
+        except FileExistsError:
+            try:
+                if time.time() - os.stat(lock_path).st_mtime > 30.0:
+                    os.unlink(lock_path)          # holder died with it held
+                    continue
+            except FileNotFoundError:
+                continue
+            time.sleep(0.025)
+    if lock_fd is None:
+        _die("账号配置的锁被占了 3 秒还没释放。数据面可能正在刷新令牌；稍后再试。")
+
+    try:
+        # Re-read under the lock: whatever we parsed before may be stale.
+        config = json.loads(CONFIG.read_text(encoding="utf-8"))
+        for entry in config.get("accounts", []):
+            if isinstance(entry, dict) and entry.get("accountUuid") == account_uuid:
+                entry.update(tokens)
+                break
+        else:
+            _die("写回时找不到账号 %s —— 配置在此期间被改过, 没有写入。"
+                 % account_uuid)
+
+        temp = CONFIG.with_suffix(CONFIG.suffix + ".claude-direct.tmp")
+        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(config, handle, indent=2, ensure_ascii=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException:
+            temp.unlink(missing_ok=True)
+            raise
+        os.replace(str(temp), str(CONFIG))
+
+        # Rename is atomic but not durable until the directory entry is synced.
+        dir_fd = os.open(str(CONFIG.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        os.close(lock_fd)
+        # Release for the data plane, not just for this process.
+        try:
+            os.unlink(lock_path)
+        except FileNotFoundError:
+            pass
+
+
+def _token_for(account: Dict[str, Any], allow_refresh: bool) -> str:
+    now = time.time()
+    access = account.get("accessToken")
+    expiry = _expires_at(account)
+
+    if access and (expiry is None or expiry - now > EXPIRY_SKEW_SECONDS):
+        # The common case, and the only one that touches nothing.
+        return str(access)
+
+    if not account.get("refreshToken"):
+        _die("%s 的令牌已过期, 而且没有 refresh token。需要重新登录: fleet login"
+             % _label(account))
+
+    if _dataplane_listening() and not allow_refresh:
+        _die("%s 的令牌已过期, 但 Fleet 数据面正在运行。\n"
+             "\n"
+             "现在刷新会和数据面抢同一个一次性 refresh token, 这正是 08-06 至\n"
+             "08-09 那批 invalid_grant 误判的成因 —— 它让四个账号被判失效。\n"
+             "\n"
+             "  Fleet 还能用   直接用 claude, 让数据面自己刷\n"
+             "  Fleet 坏了     先停掉数据面, 或加 --force-refresh 明确承担这个风险"
+             % _label(account))
+
+    _warn("令牌已过期, 正在刷新…")
+    tokens = _refresh(str(account["refreshToken"]))
+    uuid = account.get("accountUuid")
+    if uuid:
+        _write_back(str(uuid), tokens)
+    else:
+        # No uuid means we cannot address the row safely; using the token
+        # without persisting is better than writing to the wrong account.
+        _warn("这个账号没有 accountUuid, 刷新结果不写回 —— 下次还会再刷一次。")
+    return str(tokens["accessToken"])
+
+
+# --------------------------------------------------------------------------
+# binary
+# --------------------------------------------------------------------------
+
+def _version_key(name: str) -> Tuple[int, ...]:
+    try:
+        return tuple(int(part) for part in name.split("."))
+    except ValueError:
+        return (0,)
+
+
+def _find_binary(explicit: Optional[str]) -> Path:
+    if explicit:
+        path = Path(explicit).expanduser()
+        if not os.access(str(path), os.X_OK):
+            _die("%s 不是可执行文件。" % path)
+        return path
+
+    if not VERSIONS_DIR.is_dir():
+        _die("找不到原生 Claude Code: %s 不存在。\n"
+             "用 --binary 指定路径。" % VERSIONS_DIR)
+
+    # A failed download leaves a zero-byte file behind (2.1.224 on this machine),
+    # so size and the executable bit both have to be checked, not just the name.
+    usable = [p for p in VERSIONS_DIR.iterdir()
+              if p.is_file() and p.stat().st_size > 0 and os.access(str(p), os.X_OK)]
+    if not usable:
+        _die("%s 里没有可用的 Claude Code 版本。" % VERSIONS_DIR)
+    return max(usable, key=lambda p: _version_key(p.name))
+
+
+# --------------------------------------------------------------------------
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="claude-direct",
+        description="用指定账号直连启动 Claude Code, 完全绕过 Fleet 调度。",
+        epilog="`--` 之后的参数原样传给 Claude Code。")
+    parser.add_argument("account", nargs="?", help="账号名的一部分")
+    parser.add_argument("--account", dest="uuid", help="按 accountUuid 精确选择")
+    parser.add_argument("--binary", help="指定 Claude Code 可执行文件")
+    parser.add_argument("--list", action="store_true", help="只列出账号")
+    parser.add_argument("--force-refresh", action="store_true",
+                        help="数据面在运行时仍然刷新令牌 (有竞争风险)")
+
+    # Split on `--` before argparse sees it. `nargs=REMAINDER` looks like the
+    # right tool and is not: it grabs everything from the first non-option token
+    # onward, so `claude-direct acct --binary X` swallows --binary as a child
+    # argument and silently ignores it. Measured — it launched the real binary
+    # while --binary was pointing somewhere else.
+    raw = list(sys.argv[1:] if argv is None else argv)
+    forwarded: List[str] = []
+    if "--" in raw:
+        cut = raw.index("--")
+        raw, forwarded = raw[:cut], raw[cut + 1:]
+    args = parser.parse_args(raw)
+
+    accounts = _accounts(_load_config())
+    if not accounts:
+        _die("配置里没有 OAuth 账号。")
+
+    if args.list:
+        now = time.time()
+        # Width from the data, not a guess: a hardcoded column pushes the rest
+        # of the row off screen the moment one account has a long org name.
+        width = max(len(_label(a)) for a in accounts)
+        for account in accounts:
+            print("%-*s  %-14s  %s" % (
+                width, _label(account), _token_state(account, now),
+                account.get("accountUuid") or ""))
+        return 0
+
+    account = _select(accounts, args.account, args.uuid)
+    token = _token_for(account, allow_refresh=args.force_refresh)
+    binary = _find_binary(args.binary)
+
+    env = dict(os.environ)
+    for key in FLEET_ONLY_ENV:
+        env.pop(key, None)
+    # Only unset the proxy when it points at Fleet's own data plane. The owner's
+    # standing rule is that all AI traffic goes through the outbound proxy, and
+    # that rule does not stop applying because Fleet is out of the picture.
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        if "13456" in (env.get(key) or ""):
+            env.pop(key, None)
+    env["CLAUDE_CODE_OAUTH_TOKEN"] = token
+
+    _warn("直连 %s%s%s · 无调度 · 无额度预留 · 额度用尽会报错而不是等待"
+          % (BOLD, _label(account), RESET + YELLOW))
+
+    os.execve(str(binary), [str(binary)] + forwarded, env)
+    return 0  # unreachable; execve replaces the process
+
+
+if __name__ == "__main__":
+    sys.exit(main())

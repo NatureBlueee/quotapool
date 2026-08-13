@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""Say when the fleet is waiting, so waiting stops looking like breakage.
+
+    statusLine.command = ".../scripts/fleet-statusline"
+
+The owner's rule: running out of quota and waiting for a window to refresh is
+FINE — it recovers by itself and needs nobody. Returning an error is the
+violation. But a session that has gone quiet with no explanation is
+indistinguishable from one that has died, and that is what sent him looking for
+faults that were not there, twice in one day.
+
+So this adds one line, and only when there is something to say.
+
+## What it will not do
+
+- Slow the prompt down. `report_capacity` is 3ms against the 140ms `opentoken`
+  already costs; anything heavier belongs in the panel, not here. `fleet-snapshot`
+  was measured at 140-270ms and rejected for that reason.
+- Break the status line. Every failure path still prints whatever the wrapped
+  command produced. A status line that dies takes the prompt with it.
+- Interpret. The owner has been clear: show the number, not a judgement about
+  whether it is worth worrying about. It reports which accounts are out and
+  when the soonest one returns.
+- Speak when the fleet is fine. A line that is always there is a line nobody
+  reads, and there are four of those in this file's history already.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "src"))
+
+# The status line this wraps. Overridable so the wrapper is not welded to one
+# tool — it prints whatever this produces and adds at most one line.
+WRAPPED = os.environ.get(
+    "FLEET_STATUSLINE_WRAPPED",
+    str(Path.home() / ".local" / "bin" / "opentoken"),
+)
+WRAPPED_ARGS = os.environ.get("FLEET_STATUSLINE_ARGS", "statusline").split()
+
+DIM = "\033[2m"
+YELLOW = "\033[33m"
+RED = "\033[31m"
+RESET = "\033[0m"
+
+
+def _hms(seconds: float) -> str:
+    """Lowercase, and no unit that rounds to zero — the owner asked for both."""
+    seconds = max(0, int(seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes = rem // 60
+    if hours >= 24:
+        return "%dd%dh" % (hours // 24, hours % 24)
+    if hours:
+        return "%dh%dm" % (hours, minutes)
+    return "%dm" % max(1, minutes)
+
+
+def _watchdog_line() -> str:
+    """Did something roll the fleet back while nobody was looking — and is the
+    safety net currently armed at all?
+
+    This takes priority over everything else the status line might say. An
+    automatic rollback means the owner is running a version he did not choose,
+    for a reason nothing else on his screen will mention — and the whole point
+    of the watchdog acting unattended is that it must not also be silent.
+
+    Two shapes, and the difference matters. **Events** happened and stay:
+    a rollback two hours ago is still worth knowing. **Conditions** are true
+    right now and clear themselves — a stale rollback point that has since been
+    marked must stop showing, or the indicator stays red after the problem is
+    gone and gets ignored, which costs more than never showing it.
+
+    Conditions win when both exist: "there is nowhere to roll back to" is a
+    statement about this minute, and a rollback that already happened is not.
+
+    Events are cleared by deleting the file or by the next successful
+    `fleet-rollback`; conditions by the watchdog, when they stop being true.
+    """
+    try:
+        import json
+
+        alarm = json.loads(
+            (Path.home() / ".local" / "state" / "claude-fleet"
+             / "watchdog-alarm.json").read_text(encoding="utf-8"))
+    except Exception:                                        # noqa: BLE001
+        return ""
+
+    import time
+
+    conditions = alarm.get("conditions") or {}
+    known_good = conditions.get("known_good") or {}
+    if known_good.get("kind") == "known_good_missing":
+        return ("%s%s⚠ 没有任何已知良好点 —— 真出事时无处可退%s"
+                % (DIM, RED, RESET))
+    if known_good.get("kind") == "known_good_stale":
+        return ("%s%s⚠ 可回退的版本已经 %s 小时前了 —— 看 markgood 为什么没标上%s"
+                % (DIM, YELLOW, known_good.get("hours", "?"), RESET))
+    if (conditions.get("peer") or {}).get("kind") == "peer_unreachable":
+        return ("%s%s⚠ 已经一小时够不着对端 —— 那台机器现在没人看着%s"
+                % (DIM, YELLOW, RESET))
+
+    latest = alarm.get("latest") or {}
+    if not latest:
+        return ""
+
+    age = _hms(time.time() - float(latest.get("at") or 0))
+    kind = latest.get("kind")
+    if kind == "rolled_back":
+        return ("%s%s⟲ 看门狗在 %s前自动回滚了 —— 原因: %s%s"
+                % (DIM, YELLOW, age, str(latest.get("why"))[:40], RESET))
+    if kind == "rollback_failed":
+        return ("%s%s⛔ 看门狗尝试回滚但失败了 (%s前) —— 需要人%s"
+                % (DIM, RED, age, RESET))
+    if kind == "still_down_after_rollback":
+        return ("%s%s⛔ 回滚后舰队仍未恢复 (%s前) —— 问题不在版本%s"
+                % (DIM, RED, age, RESET))
+    if kind == "down_no_target":
+        return ("%s%s⛔ 舰队故障且没有可回退的版本 (%s前)%s"
+                % (DIM, RED, age, RESET))
+    return ""
+
+
+def _fleet_line() -> str:
+    """One line, or nothing at all."""
+    alarm = _watchdog_line()
+    if alarm:
+        # Deliberately returns early. Quota is not the news when the version
+        # running is not the one anybody chose.
+        return alarm
+    try:
+        import json
+
+        from claude_fleet.capacity import report_capacity
+        from claude_fleet.db import FleetDB
+
+        runtime = json.loads(
+            (Path.home() / ".config" / "claude-fleet" / "runtime.json")
+            .read_text(encoding="utf-8"))
+        report = report_capacity(FleetDB(runtime["db_path"]), "interactive")
+    except Exception:                                        # noqa: BLE001
+        # No fleet, no database, no opinion. Silence is correct here: this
+        # wrapper must work on a machine that has never run Fleet.
+        return ""
+
+    all_accounts = ((report.get("usable_accounts") or [])
+                    + (report.get("blocked_accounts") or []))
+    usable = [a for a in report.get("usable_accounts") or []
+              if (a.get("weekly_remaining_after_floor") or 0) > 0.01]
+
+    if usable:
+        # Capacity loss used to be invisible until it reached zero. Four of six
+        # accounts were gone for four days while this line said nothing, because
+        # one account still had room — and by the rule above, one account with
+        # room is silence. The owner found out by noticing the fleet felt slow.
+        #
+        # So: say something as soon as the fleet is down to its last account,
+        # and stay quiet while there is real redundancy. A line that is always
+        # there is a line nobody reads.
+        if len(usable) == 1 and len(all_accounts) > 1:
+            return "%s%s⚠ 只剩 1/%d 个账号有额度%s" % (
+                DIM, YELLOW, len(all_accounts), RESET)
+        return ""
+
+    blocked = list(report.get("blocked_accounts") or [])
+    blocked += [a for a in report.get("usable_accounts") or [] if a not in usable]
+    resets = [a["resets_in_hours"] for a in blocked
+              if a.get("resets_in_hours") is not None]
+    if not resets:
+        return "%s%s⏳ 额度已用尽%s" % (DIM, YELLOW, RESET)
+
+    soonest = min(resets)
+    return "%s%s⏳ 额度已用尽 · 最近刷新 %s%s" % (
+        DIM, YELLOW, _hms(soonest * 3600), RESET)
+
+
+def main() -> int:
+    stdin = sys.stdin.read() if not sys.stdin.isatty() else ""
+    try:
+        result = subprocess.run(
+            [WRAPPED, *WRAPPED_ARGS], input=stdin,
+            capture_output=True, text=True, timeout=10)
+        base = result.stdout.rstrip("\n")
+    except Exception as exc:                                 # noqa: BLE001
+        # The wrapped tool failing is not this wrapper's failure to hide, but
+        # the prompt still has to render.
+        base = "%s[statusline: %s]%s" % (DIM, str(exc)[:60], RESET)
+
+    line = _fleet_line()
+    # The wrapped tool ends without a newline, and adding one puts a blank row
+    # under the prompt. Only separate the two when there is a second one.
+    if base:
+        sys.stdout.write(base)
+        if line:
+            sys.stdout.write("\n")
+    if line:
+        sys.stdout.write(line)
+    sys.stdout.flush()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

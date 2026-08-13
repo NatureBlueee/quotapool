@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+
+BIN_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SETTINGS=${CLAUDE_FLEET_LOCAL_SETTINGS:-"$HOME/.config/claude-fleet/claude-settings-overlay.json"}
+
+if [ ! -r "$SETTINGS" ]; then
+  printf '%s\n' \
+    "claude-fleet-local: settings overlay is missing: $SETTINGS" \
+    "Run the local Claude Fleet setup before launching managed sessions." >&2
+  exit 78
+fi
+
+TAB_ID=${ITERM_SESSION_ID:-${TERM_SESSION_ID:-standalone-$$}}
+SAFE_TAB_ID=$(printf '%s' "$TAB_ID" | tr -c 'A-Za-z0-9_.-' '_')
+WORKLOAD_ID="mac-iterm:$SAFE_TAB_ID"
+
+export FLEET_LOCAL_ENABLED=1
+export FLEET_WORKLOAD_ID="$WORKLOAD_ID"
+exec "$BIN_DIR/fleet" run \
+  --class interactive \
+  --workload-id "$WORKLOAD_ID" \
+  -- \
+  --settings "$SETTINGS" \
+  "$@"

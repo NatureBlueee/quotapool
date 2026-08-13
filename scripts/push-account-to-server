@@ -1,0 +1,202 @@
+#!/bin/sh
+# Generate a setup-token on THIS machine (where a browser exists) and install it
+# on the server.
+#
+# The server has no browser. That is fine: `claude setup-token` exists precisely
+# for headless hosts — the interactive half happens wherever you run it, and the
+# result is just a credential string. The server's three existing accounts all
+# carry `source: setup-token` in exactly this format (sk-ant-oat01-…, 108 chars),
+# so they were installed this way too.
+#
+# Why setup-tokens rather than copying the Mac's OAuth credentials: refresh
+# tokens rotate (`oauth.js:116` is `data.refresh_token || refreshToken`), so two
+# hosts holding one OAuth family knock each other out — primary-current is in
+# that broken state today. A setup-token is a separate authorization for the
+# same account; the server's three have coexisted with the Mac's OAuth for a
+# week with zero invalid_grant.
+#
+# What this unlocks: the server's data plane can only execute accounts it holds
+# credentials for (`fleet-coordinator.js:242` throws "selected unknown account"
+# otherwise), so hey@ and hello@ headroom is unreachable from the server until
+# their credentials exist there. See CROSS-HOST-AUDIT-001.md.
+#
+# Usage:
+#   push-account-to-server hey   00000000-0000-4000-8000-000000000003
+#   push-account-to-server hello 00000000-0000-4000-8000-000000000004
+#
+# It will open a browser for you to log in AS THAT ACCOUNT, then do everything
+# else unattended.
+
+set -eu
+
+NAME=${1:-}
+UUID=${2:-}
+SERVER=${FLEET_SERVER:-peer-host}
+
+if [ -z "$NAME" ] || [ -z "$UUID" ]; then
+  cat >&2 <<'EOF'
+usage: push-account-to-server <name> <account-uuid>
+
+  name  account name to create on the server (e.g. hey)
+  uuid  the account's real UUID, so both hosts agree on one identity
+
+Accounts the server is missing (UUIDs matched by weekly-reset fingerprint):
+  hey    00000000-0000-4000-8000-000000000003   second@example.com
+  hello  00000000-0000-4000-8000-000000000004   third@example.com
+
+Override the target host with FLEET_SERVER=<ssh-alias>.
+EOF
+  exit 64
+fi
+
+case "$UUID" in
+  ????????-????-????-????-????????????) ;;
+  *) printf '%s\n' "not a UUID: $UUID" >&2; exit 64 ;;
+esac
+
+CLAUDE=$(python3 -c 'import json,os;print(json.load(open(os.path.expanduser("~/.config/claude-fleet/runtime.json")))["claude_binary"])')
+[ -x "$CLAUDE" ] || { printf '%s\n' "claude binary not executable: $CLAUDE" >&2; exit 78; }
+
+# The login flow must NOT go through the Fleet data plane, and this is why
+# setup-token was timing out after the browser step succeeded.
+#
+# The code exchange posts to platform.claude.com, but the MITM only terminates
+# api.anthropic.com; everything else is a blind tunnel opened with
+# `net.connect(port, host)` (mitm.js:212) — raw TCP that ignores HTTPS_PROXY
+# entirely. So the request left the data plane as a direct connection, and
+# measured here, a direct connection to platform.claude.com does not complete:
+#
+#   via the data plane   HTTP 000, timed out at 25s
+#   direct               HTTP 000, timed out at 25s
+#   via outbound_proxy   HTTP 400 in 1.1s   <- reaches the server
+#
+# Routing the login through outbound_proxy instead is also correct on the merits:
+# this is an authorization flow for a NEW account, not a model request, so it has
+# no business being routed or having an account token injected. The data plane
+# stays untouched and every model request keeps going through it.
+OUTBOUND=$(python3 -c 'import json,os;print(json.load(open(os.path.expanduser("~/.config/claude-fleet/runtime.json"))).get("outbound_proxy",""))')
+if [ -n "$OUTBOUND" ]; then
+  printf 'login will use outbound proxy %s (not the Fleet data plane)\n' "$OUTBOUND"
+  export HTTPS_PROXY="$OUTBOUND" HTTP_PROXY="$OUTBOUND"
+  export https_proxy="$OUTBOUND" http_proxy="$OUTBOUND"
+  unset ALL_PROXY all_proxy 2>/dev/null || true
+  export NO_PROXY="localhost,127.0.0.1,::1" no_proxy="localhost,127.0.0.1,::1"
+else
+  printf 'no outbound_proxy configured; unsetting Fleet proxy for the login\n'
+  unset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy ALL_PROXY all_proxy 2>/dev/null || true
+fi
+# A stale sentinel from an outer Fleet shell would make the login fail with a
+# credential error rather than a timeout.
+unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN 2>/dev/null || true
+
+if ! curl -s -o /dev/null --max-time 15 https://platform.claude.com/v1/oauth/token -X POST -d '{}' 2>/dev/null; then
+  case $? in
+    28) printf '%s\n' "cannot reach platform.claude.com (timeout) — the login will hang; check the outbound proxy" >&2; exit 75 ;;
+  esac
+fi
+
+WORK=$(mktemp -d)
+chmod 700 "$WORK"
+TOKEN_FILE="$WORK/$NAME.token"
+# The token is a live credential. Remove it from this machine whatever happens —
+# it is only ever needed on the server.
+trap 'rm -rf "$WORK"' EXIT INT TERM
+
+cat <<EOF
+
+== Step 1 of 3: log in as the account you want to add ==
+
+A browser flow starts now. Log in as the account whose UUID is
+  $UUID
+NOT as whichever account you happen to be signed in as.
+
+Paste the token it prints when prompted below.
+
+EOF
+
+# `setup-token` is interactive and prints the token to the terminal; it has no
+# --output flag, so the token is read back here rather than captured.
+"$CLAUDE" setup-token || {
+  printf '\n%s\n' "setup-token did not complete; nothing was changed." >&2
+  exit 75
+}
+
+cat <<'EOF'
+
+Paste the token and press Enter.
+
+Echo stays ON deliberately. An earlier version hid it, and two tokens arrived
+truncated — 99 characters instead of 108 — which imported cleanly and then
+failed upstream with "OAuth access token is invalid". A credential you cannot
+see is a credential you cannot check, and a silently truncated one costs far
+more than the scrollback risk it avoids.
+
+EOF
+printf '> '
+IFS= read -r TOKEN
+printf '\n'
+
+# Strip anything a paste may have carried in: CR from a Windows clipboard, and
+# leading/trailing whitespace.
+TOKEN=$(printf '%s' "$TOKEN" | tr -d '\r\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+
+case "$TOKEN" in
+  "") printf '%s\n' "no token entered; nothing was changed." >&2; exit 65 ;;
+  sk-ant-oat01-*) ;;
+  *) printf '%s\n' "that does not look like a setup-token (expected sk-ant-oat01-…)" >&2; exit 65 ;;
+esac
+
+# Length is the check that would have caught the truncation. Every working
+# setup-token on the server is exactly 108 characters; the two that failed were
+# 99. Warn rather than hard-fail, since the format is Anthropic's to change.
+TOKEN_LEN=$(printf '%s' "$TOKEN" | wc -c | tr -d ' ')
+printf 'token captured: %d characters\n' "$TOKEN_LEN"
+if [ "$TOKEN_LEN" -lt 100 ]; then
+  cat >&2 <<EOF
+
+REFUSING: this token is $TOKEN_LEN characters. Known-good setup-tokens are 108.
+A short one is almost certainly an incomplete paste — it will import without
+complaint and then fail every request with "OAuth access token is invalid".
+
+Copy the token again, making sure you have the whole string, and re-run.
+EOF
+  exit 65
+fi
+
+umask 077
+printf '%s' "$TOKEN" > "$TOKEN_FILE"
+chmod 600 "$TOKEN_FILE"
+printf 'token captured (%d chars)\n' "$(printf '%s' "$TOKEN" | wc -c | tr -d ' ')"
+
+printf '\n== Step 2 of 3: transferring to %s ==\n' "$SERVER"
+REMOTE=/home/nature/.config/claude-fleet/setup-tokens/$NAME.token
+# scp as the login user, then move into place as nature with tight modes: the
+# importer refuses a file that is group- or other-readable, or not owned by the
+# caller.
+scp -q "$TOKEN_FILE" "$SERVER:/tmp/$NAME.token"
+ssh "$SERVER" "set -e
+  sudo -n -u nature mkdir -p /home/nature/.config/claude-fleet/setup-tokens
+  sudo -n -u nature chmod 700 /home/nature/.config/claude-fleet/setup-tokens
+  sudo -n cp /tmp/$NAME.token '$REMOTE'
+  sudo -n chown nature:nature '$REMOTE'
+  sudo -n chmod 600 '$REMOTE'
+  rm -f /tmp/$NAME.token"
+printf '  installed at %s (0600, owned by nature)\n' "$REMOTE"
+
+printf '\n== Step 3 of 3: importing and verifying ==\n'
+ssh "$SERVER" "sudo -n -u nature env HOME=/home/nature \
+  /home/nature/.local/share/claude-fleet/scripts/import-server-account \
+  '$NAME' '$UUID' '$REMOTE'"
+
+cat <<EOF
+
+Done for "$NAME". The local copy of the token has been deleted.
+
+Verify it can actually serve — the point of the exercise:
+
+  ssh $SERVER "sudo -u nature env HOME=/home/nature \\
+    /home/nature/.local/share/claude-fleet/scripts/fleet-health"
+
+$NAME should appear with real headroom, and the fleet should stop reporting
+"0 of N usable".
+EOF

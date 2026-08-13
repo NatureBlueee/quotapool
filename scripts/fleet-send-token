@@ -1,0 +1,157 @@
+#!/bin/sh
+# Send a setup-token you already have to the server. No login, no browser.
+#
+# push-account-to-server runs the whole flow including `claude setup-token`.
+# When you already hold the token, that login step is pure friction — and the
+# earlier run proved it can also silently corrupt the result. This is just the
+# transfer and import half.
+#
+#   fleet-send-token hey   00000000-0000-4000-8000-000000000003
+#   fleet-send-token hello 00000000-0000-4000-8000-000000000004
+#
+# It prompts for the token WITH ECHO ON. That is deliberate: hiding it is how
+# two tokens arrived truncated (99 characters instead of 108), imported without
+# complaint, and then failed every request with "OAuth access token is invalid".
+# A credential you cannot see is one you cannot check. Anything under 100
+# characters is refused rather than installed.
+#
+# You can also pipe it, which avoids the terminal entirely:
+#
+#   pbpaste | fleet-send-token hey 00000000-0000-4000-8000-000000000003
+
+set -eu
+
+NAME=${1:-}
+UUID=${2:-}
+SERVER=${FLEET_SERVER:-peer-host}
+
+if [ -z "$NAME" ] || [ -z "$UUID" ]; then
+  cat >&2 <<'EOF'
+usage: fleet-send-token <name> <account-uuid>
+
+  name  account name on the server (e.g. hey)
+  uuid  the account's real UUID, so both hosts agree on one identity
+
+Accounts the server still needs (UUIDs matched by weekly-reset fingerprint):
+  hey    00000000-0000-4000-8000-000000000003   second@example.com
+  hello  00000000-0000-4000-8000-000000000004   third@example.com
+
+Paste the token when prompted, or pipe it:
+  pbpaste | fleet-send-token hey 00000000-0000-4000-8000-000000000003
+EOF
+  exit 64
+fi
+
+case "$UUID" in
+  ????????-????-????-????-????????????) ;;
+  *) printf '%s\n' "not a UUID: $UUID" >&2; exit 64 ;;
+esac
+
+if [ -t 0 ]; then
+  printf 'Paste the setup-token for %s and press Enter:\n> ' "$NAME"
+  IFS= read -r TOKEN
+  printf '\n'
+else
+  IFS= read -r TOKEN
+fi
+
+# Strip whatever a paste may carry: CR from a Windows clipboard, stray
+# whitespace at either end.
+TOKEN=$(printf '%s' "$TOKEN" | tr -d '\r\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+
+case "$TOKEN" in
+  "") printf '%s\n' "no token given; nothing was changed." >&2; exit 65 ;;
+  sk-ant-oat01-*) ;;
+  *) printf '%s\n' "that does not look like a setup-token (expected sk-ant-oat01-…)" >&2; exit 65 ;;
+esac
+
+LEN=$(printf '%s' "$TOKEN" | wc -c | tr -d ' ')
+printf 'token: %d characters\n' "$LEN"
+if [ "$LEN" -lt 100 ]; then
+  cat >&2 <<EOF
+
+REFUSING: $LEN characters. Working setup-tokens are 108.
+
+This is exactly how the last two failed — short tokens import cleanly and then
+return "OAuth access token is invalid" on every request. Copy the whole string
+and try again.
+EOF
+  exit 65
+fi
+
+WORK=$(mktemp -d)
+chmod 700 "$WORK"
+trap 'rm -rf "$WORK"' EXIT INT TERM
+umask 077
+printf '%s' "$TOKEN" > "$WORK/$NAME.token"
+chmod 600 "$WORK/$NAME.token"
+
+printf '\n== transferring to %s ==\n' "$SERVER"
+REMOTE=/home/nature/.config/claude-fleet/setup-tokens/$NAME.token
+scp -q "$WORK/$NAME.token" "$SERVER:/tmp/$NAME.token"
+ssh "$SERVER" "set -e
+  sudo -n -u nature mkdir -p /home/nature/.config/claude-fleet/setup-tokens
+  sudo -n -u nature chmod 700 /home/nature/.config/claude-fleet/setup-tokens
+  sudo -n cp /tmp/$NAME.token '$REMOTE'
+  sudo -n chown nature:nature '$REMOTE'
+  sudo -n chmod 600 '$REMOTE'
+  rm -f /tmp/$NAME.token
+  # The importer refuses an account name that already exists, so replacing a
+  # broken credential means removing the old entry first. The config is backed
+  # up by import-server-account immediately after this.
+  sudo -n -u nature python3 - '$NAME' <<'PY'
+import json, os, sys, tempfile
+path = '/home/nature/.config/claude-fleet/teamclaude.json'
+name = sys.argv[1]
+data = json.load(open(path))
+before = len(data.get('accounts', []))
+data['accounts'] = [a for a in data.get('accounts', []) if a.get('name') != name]
+if len(data['accounts']) != before:
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
+    with os.fdopen(fd, 'w') as handle:
+        json.dump(data, handle, indent=2, ensure_ascii=False)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    print(f'  removed the previous {name} entry')
+PY"
+printf '  installed at %s (0600, owned by nature)\n' "$REMOTE"
+
+printf '\n== importing ==\n'
+ssh "$SERVER" "sudo -n -u nature env HOME=/home/nature \
+  /home/nature/.local/share/claude-fleet/scripts/import-server-account \
+  '$NAME' '$UUID' '$REMOTE'"
+
+printf '\n== proving the credential actually works ==\n'
+# The real test. A token can import cleanly and still be dead — that is what
+# happened last time, and only a live request against the upstream shows it.
+ssh "$SERVER" "sudo -n -u nature python3 - '$NAME' <<'PY'
+import json, urllib.request, urllib.error
+name = __import__('sys').argv[1]
+data = json.load(open('/home/nature/.config/claude-fleet/teamclaude.json'))
+token = [a for a in data['accounts'] if a['name'] == name][0]['accessToken']
+request = urllib.request.Request(
+    'https://api.anthropic.com/v1/messages',
+    data=json.dumps({'model': 'claude-fable-5', 'max_tokens': 8,
+                     'messages': [{'role': 'user', 'content': 'hi'}]}).encode(),
+    headers={'authorization': 'Bearer ' + token,
+             'anthropic-version': '2023-06-01',
+             'content-type': 'application/json',
+             'anthropic-beta': 'oauth-2025-04-20'})
+try:
+    response = urllib.request.urlopen(request, timeout=25)
+    print(f'  {name}: HTTP {response.status} — credential works')
+except urllib.error.HTTPError as exc:
+    if exc.code == 429:
+        print(f'  {name}: HTTP 429 rate limited — credential VALID (quota spent)')
+    elif exc.code == 401:
+        print(f'  {name}: HTTP 401 — CREDENTIAL IS DEAD, re-copy the token')
+        raise SystemExit(1)
+    else:
+        print(f'  {name}: HTTP {exc.code} {exc.read()[:120].decode(\"replace\")}')
+except Exception as exc:
+    print(f'  {name}: could not reach upstream: {exc}')
+PY"
+
+printf '\nDone. Fleet health on the server:\n\n'
+ssh "$SERVER" "sudo -n -u nature env HOME=/home/nature \
+  /home/nature/.local/share/claude-fleet/scripts/fleet-health" || true
