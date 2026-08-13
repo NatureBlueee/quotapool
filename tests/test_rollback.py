@@ -21,6 +21,40 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _no_test_may_touch_a_real_host(monkeypatch):
+    """Every host contact must be stubbed by the test that wants it.
+
+    `test_a_soaked_version_with_slow_decisions_is_refused` stubbed `_soak_clean`
+    but not `_serviceable`, which runs first — so on a machine with a live fleet
+    it quietly probed the real coordinator, got a 200, and carried on to the
+    check it meant to test. It passed for a reason that had nothing to do with
+    the assertion. On CI, where no fleet exists, `_serviceable` failed first and
+    the test never reached its own subject.
+
+    Green on the maintainer's laptop and red everywhere else is the worst
+    possible arrangement, so an unstubbed call is now an immediate, named error
+    rather than a silent trip to whatever machine happens to be running this.
+
+    Local subprocesses are left alone — several tests here drive real `git` in a
+    temp directory on purpose, and that is hermetic. What is blocked is `ssh`,
+    the unambiguous signal that a test is about to leave this machine.
+    """
+    import subprocess as real
+
+    original = real.run
+
+    def guard(args, *rest, **kwargs):
+        argv = args if isinstance(args, (list, tuple)) else [args]
+        if argv and str(argv[0]) == "ssh":
+            raise AssertionError(
+                "这个测试要 ssh 去真实对端了 —— 把它需要的那次交互显式桩掉 "
+                "(_run_python_on / _serviceable / _hosts_agree)。")
+        return original(args, *rest, **kwargs)
+
+    monkeypatch.setattr(real, "run", guard)
+
+
 def _module():
     path = Path(__file__).resolve().parent.parent / "scripts" / "fleet-rollback"
     spec = importlib.util.spec_from_loader("rollback", loader=None)
@@ -166,6 +200,7 @@ def test_marking_records_a_version_that_has_soaked(monkeypatch, tmp_path):
     monkeypatch.setattr(module, "_git", lambda *a: (
         "abc1234def" if a[0] == "rev-parse" else "a subject"))
     monkeypatch.setattr(module, "_soak_clean", lambda hours: None)
+    monkeypatch.setattr(module, "_serviceable", lambda: None)
     monkeypatch.setattr(module, "_hosts_agree", lambda: None)
     monkeypatch.setattr(module, "_health", lambda host: {
         "coordinator": True, "dataplane": True, "doctor_clean": True,
@@ -260,6 +295,10 @@ def test_a_soaked_version_with_slow_decisions_is_refused(monkeypatch, tmp_path,
         "abc123" if a[0] == "rev-parse" else "subject"))
     monkeypatch.setattr(module, "_soak_clean",
                         lambda hours: "本机 在浸泡期内有 7 次慢决策")
+    # 这一条是 CI 逼出来的: _serviceable 排在 _soak_clean 前面, 不桩掉它,
+    # 这个测试在有活舰队的机器上是靠真实探针"过"的, 在没有的机器上根本走不到
+    # 它自己要测的那一步。
+    monkeypatch.setattr(module, "_serviceable", lambda: None)
     monkeypatch.setattr(module, "_health", lambda host: {
         "coordinator": True, "dataplane": True, "doctor_clean": True})
 

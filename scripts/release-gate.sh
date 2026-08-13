@@ -82,8 +82,13 @@ run "Python control-plane tests" \
   "$PYTHON" -m pytest tests/ -q
 
 if [ -n "$NODE" ] && command -v "$NODE" >/dev/null 2>&1; then
+  # `node --test` with no argument, from that directory. The glob form
+  # (`--test 'test/**/*.test.js'`) needs Node 22 — on Node 20 the pattern is
+  # passed through literally and node reports "Could not find …". It worked on
+  # the maintainer's machine and ran **zero** of the 118 data-plane tests in CI,
+  # which is the precise failure `--release` exists to make loud.
   run "Node data-plane tests" \
-    sh -c "cd '$PREFIX/vendor/teamclaude' && '$NODE' --test 'test/**/*.test.js'"
+    sh -c "cd '$PREFIX/vendor/teamclaude' && '$NODE' --test"
 else
   skip "Node data-plane tests" "找不到 node —— 数据面 86 条测试一条没跑"
 fi

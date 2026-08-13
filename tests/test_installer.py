@@ -55,11 +55,34 @@ def _config(home):
     return legacy if legacy.exists() else home / ".config" / "quotapool"
 
 
+def _env(home):
+    """A HOME override is not isolation on its own.
+
+    `install.sh` honours `XDG_CONFIG_HOME` and `XDG_STATE_HOME`, which is
+    correct — but these tests only overrode `HOME` and let the XDG variables
+    leak in from the environment. On a machine that sets them (GitHub's Linux
+    runners do) the installer wrote its config **outside the scratch HOME**, so
+    every assertion about `$HOME/.config/quotapool` failed — and, worse, the
+    test suite wrote a `runtime.json` and a `teamclaude.json` into the real
+    user's config directory.
+
+    Found by CI within two minutes of this repository going public; invisible on
+    the machine it was written on, which does not set them.
+    """
+    return {
+        **os.environ,
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": str(home / ".config"),
+        "XDG_STATE_HOME": str(home / ".local" / "state"),
+        "XDG_DATA_HOME": str(home / ".local" / "share"),
+    }
+
+
 def _run(home, *args, expect=0):
     result = subprocess.run(
         ["sh", str(INSTALLER), *args],
         cwd=str(REPO), capture_output=True, text=True,
-        env={**os.environ, "HOME": str(home)}, timeout=180)
+        env=_env(home), timeout=180)
     if expect is not None:
         # The arguments and the code, not just the output. This assertion fired
         # once with both streams empty, which told the reader nothing at all
@@ -259,7 +282,7 @@ def test_a_token_that_starts_with_a_hyphen_still_installs(home, tmp_path):
     result = subprocess.run(
         ["sh", str(INSTALLER), "--no-services"], cwd=str(REPO),
         capture_output=True, text=True, timeout=180,
-        env={**os.environ, "HOME": str(home),
+        env={**_env(home),
              # The other value on that command line that does not come from this
              # script. Nobody's proxy URL starts with a hyphen, but the argument
              # is passed the same way and so is fixed the same way, and an
@@ -335,6 +358,8 @@ def test_every_job_this_repo_depends_on_can_actually_be_installed():
         "  %s — %s" % (label, why) for label, why in missing.items())
 
 
+@pytest.mark.skipif(shutil.which("plutil") is None,
+                    reason="plutil 是 macOS 的; Linux 上 launchd 模板不适用")
 def test_every_template_survives_plutil(tmp_path):
     """A malformed plist is accepted silently by the file system and refused by
     launchd, so the job simply never runs — the same failure being fixed here,
