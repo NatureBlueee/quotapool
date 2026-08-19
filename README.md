@@ -241,6 +241,20 @@ original.
 Not an Anthropic product, and not affiliated with Anthropic. The unrelated `claude-fleet`
 package on npm is somebody else's project, and has no connection to this one.
 
+## Its sibling: wake-watcher
+
+[wake-watcher](https://github.com/NatureBlueee/wake-watcher) treats a different
+disease. Quotapool handles **"the quota window is spent, so everything stops"**,
+and needs you to hold more than one subscription for the pooling to mean anything.
+wake-watcher handles **"a network or server-side error stalled one session
+mid-turn"** — which happens on a single account, on one machine, at three in the
+morning, and leaves an agent sitting there having done nothing for hours.
+
+Neither replaces the other, and neither is a superset. Running out of quota and
+being cut off mid-response are different failures with different correct responses:
+one waits for a window to reopen, the other retries immediately. Running both is
+reasonable; so is running only the one whose failure you actually have.
+
 ## Licence
 
 MIT. See `LICENSE`, and `vendor/teamclaude/LICENSE` for the fork's upstream.
