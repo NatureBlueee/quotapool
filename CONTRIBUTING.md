@@ -10,10 +10,19 @@ git clone https://github.com/NatureBlueee/quotapool
 cd quotapool
 pip install -e '.[dev]'      # the only dependency is pytest, and only for tests
 
-./scripts/release-gate.sh --release   # syntax, plists, schema round-trip
-python3 -m pytest tests/ -q           # 486 tests
-cd vendor/teamclaude && node --test   # 118 tests
+./scripts/release-gate.sh --release
 ```
+
+This is also the CI entry point. It runs the Python suite (including the
+publishable-tree scan), Node suite, syntax checks, platform checks and schema
+migration round trip once. A failed check or missing required runtime fails
+the gate. GitHub Actions runs it on macOS and Linux with Python 3.9 and 3.13.
+
+For a focused edit, run its relevant test directly; run the full gate before
+merging. Use `scripts/fleet-make-release --out DIR` to prepare a scanned public
+tree. Keep private repository history out of the public repository. Public
+releases and service deployment are separate steps; the CI workflow neither
+restarts services nor deploys to the maintainer's machines.
 
 Everything runs offline. There are no live-service tests, no fixtures that need
 credentials, and no secrets in CI. If something asks you for a token to run a
@@ -87,7 +96,7 @@ public issue.
 | `src/claude_fleet/` | control plane — decides which subscription serves a request. Holds no tokens. |
 | `vendor/teamclaude/` | data plane — a fork of TeamClaude, holds the credentials. See `NOTICE`. |
 | `scripts/` | operational tools: rollback, watchdog, backup, escape hatch, release builder |
-| `tests/`, `vendor/teamclaude/test/` | 604 tests |
+| `tests/`, `vendor/teamclaude/test/` | control-plane and data-plane regression suites |
 | `docs/DEPLOYMENT.md` | what it takes over, and the one deployment we can vouch for |
 | `THREAT-MODEL.md` | who the adversary is, and the known-weak areas, stated rather than hidden |
 

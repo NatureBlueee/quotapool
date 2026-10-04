@@ -51,16 +51,3 @@ jobs:
         # it the gate once printed "all checks passed" on a machine where node
         # was not installed and the JavaScript checks had silently skipped.
         run: ./scripts/release-gate.sh --release
-
-      - name: Python tests
-        run: python3 -m pytest tests/ -q
-
-      - name: Data plane tests
-        working-directory: vendor/teamclaude
-        run: node --test
-
-      - name: Publishable tree is clean
-        # The allow-list plus a scan for credentials, addresses and internal
-        # hostnames. It has caught a real leak; it belongs in CI, not in
-        # somebody's memory of what to check before a release.
-        run: python3 -m pytest tests/test_release_hygiene.py -q
