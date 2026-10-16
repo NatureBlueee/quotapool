@@ -25,6 +25,18 @@ import urllib.request
 import pytest
 
 
+def test_coordinator_refuses_duplicate_listener(tmp_path):
+    from claude_fleet.coordinator import serve_coordinator
+
+    first = serve_coordinator(str(tmp_path / "first.sqlite3"), port=0)
+    host, port = first.server_address
+    try:
+        with pytest.raises(OSError):
+            serve_coordinator(str(tmp_path / "second.sqlite3"), host=host, port=port)
+    finally:
+        first.server_close()
+
+
 def _post(base, path, payload, token=None, raw=None):
     headers = {"Content-Type": "application/json"}
     if token:
@@ -88,6 +100,95 @@ def test_health_needs_no_credentials_and_that_is_the_trap(coordinator_server):
     base, _token = coordinator_server
     status, payload = _get(base, "/health")
     assert status == 200 and payload["ok"] is True
+    assert payload["maintenance"]["enabled"] is True
+
+
+def test_automatic_maintenance_records_a_bounded_summary(monkeypatch, tmp_path):
+    from claude_fleet import coordinator as module
+    from claude_fleet.db import FleetDB
+
+    monkeypatch.setattr(module.maintenance_module, "sweep", lambda db, now=None: {
+        "events_removed": 12,
+        "executions_abandoned": 3,
+        "at": now,
+        "dry_run": False,
+    })
+    status = {}
+    module._run_maintenance_once(
+        FleetDB(str(tmp_path / "fleet.sqlite3")), status, now=1000,
+    )
+    assert status["running"] is False
+    assert status["lastCompletedAt"] == 1000
+    assert status["lastResult"] == {
+        "events_removed": 12,
+        "executions_abandoned": 3,
+    }
+
+
+def test_failed_maintenance_retries_soon_without_busy_loop(monkeypatch, tmp_path):
+    from claude_fleet import coordinator as module
+    from claude_fleet.db import FleetDB
+
+    attempts = []
+
+    def flaky_sweep(db, now=None):
+        attempts.append(db)
+        if len(attempts) == 1:
+            raise OSError("temporary database access failure")
+        return {"events_removed": 0}
+
+    class StopAfterRecovery:
+        def __init__(self):
+            self.delays = []
+
+        def is_set(self):
+            return False
+
+        def wait(self, seconds):
+            self.delays.append(seconds)
+            return len(self.delays) == 3
+
+    monkeypatch.setattr(module.maintenance_module, "sweep", flaky_sweep)
+    stop = StopAfterRecovery()
+    status = {}
+    module._maintenance_loop(
+        FleetDB(str(tmp_path / "fleet.sqlite3")), status, stop,
+        initial_delay=1, interval=6 * 60 * 60,
+    )
+    assert stop.delays == [1, 5 * 60, 6 * 60 * 60]
+    assert status["consecutiveFailures"] == 0
+    assert status["lastError"] is None
+    assert status["lastCompletedAt"] is not None
+
+
+def test_maintenance_retry_backoff_is_capped(monkeypatch, tmp_path):
+    from claude_fleet import coordinator as module
+    from claude_fleet.db import FleetDB
+
+    def failing_sweep(db, now=None):
+        raise OSError("database unavailable")
+
+    class StopAfterFiveFailures:
+        def __init__(self):
+            self.delays = []
+
+        def is_set(self):
+            return False
+
+        def wait(self, seconds):
+            self.delays.append(seconds)
+            return len(self.delays) == 6
+
+    monkeypatch.setattr(module.maintenance_module, "sweep", failing_sweep)
+    stop = StopAfterFiveFailures()
+    status = {}
+    module._maintenance_loop(
+        FleetDB(str(tmp_path / "fleet.sqlite3")), status, stop,
+        initial_delay=1, interval=6 * 60 * 60,
+    )
+    assert stop.delays == [1, 300, 600, 1200, 1800, 1800]
+    assert status["consecutiveFailures"] == 5
+    assert "lastCompletedAt" not in status
 
 
 def test_a_coordinator_with_no_token_serves_but_counts_it(monkeypatch, tmp_path):
@@ -206,7 +307,7 @@ def test_an_oversized_body_is_refused_and_the_server_survives(coordinator_server
         status, _ = _post(base, "/v1/route/decide", None, token=token,
                           raw=huge.encode("utf-8"))
         assert status == 413
-    except urllib.error.URLError:
+    except (urllib.error.URLError, ConnectionError):
         pass          # refused mid-upload, which is the stronger behaviour
 
     assert _get(base, "/health")[0] == 200, "one oversized body is not an outage"
@@ -257,6 +358,25 @@ def test_a_routing_decision_travels_the_whole_path(coordinator_server):
 
     assert status == 200, payload
     assert payload.get("account_id") == "acct-1", payload
+
+
+def test_desktop_workload_routes_through_the_interactive_policy(coordinator_server):
+    base, token = coordinator_server
+    status, payload = _post(base, "/v1/route/decide", {
+        "session_id": "desktop-session",
+        "holder": "desktop-window",
+        "generation": 1,
+        "workload_class": "desktop",
+        "accounts": [{
+            "id": "desktop-account", "name": "desktop-account", "type": "oauth",
+            "index": 0, "account_uuid": "desktop-account", "priority": 0,
+            "disabled": False, "status": "active", "eligible": True,
+            "quota": {"unified7d": 0.1, "unified5h": 0.1},
+        }],
+    }, token=token)
+
+    assert status == 200, payload
+    assert payload.get("account_id") == "desktop-account", payload
 
 
 def test_a_spent_fleet_answers_no_capacity_rather_than_failing(coordinator_server):

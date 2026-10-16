@@ -5,6 +5,7 @@ import hmac
 import json
 import os
 import signal
+import socket
 import sys
 import threading
 import time
@@ -20,16 +21,114 @@ from .control import (
     NoCapacity,
     NotFound,
 )
-from .db import FleetDB
+from .db import FleetDB, WriteBudgetExceeded
+from . import maintenance as maintenance_module
 
 
 MAX_BODY_BYTES = 1024 * 1024
+DEFAULT_MAINTENANCE_INTERVAL_SECONDS = 6 * 60 * 60
+DEFAULT_MAINTENANCE_INITIAL_DELAY_SECONDS = 60
+MAINTENANCE_RETRY_BASE_SECONDS = 5 * 60
+MAINTENANCE_RETRY_MAX_SECONDS = 30 * 60
 
 # Mirrors the data plane's FLEET_AUTH_MODE. `audit` (the default) changes
 # nothing for anyone and only counts what enforcing would have refused; the flip
 # to `enforce` is meant to be made from that count after a long enough window,
 # and reverted with an environment variable rather than a code rollback.
 AUTH_AUDIT = {"unauthenticated_serves": 0, "last_at": None}
+
+
+class CoordinatorHTTPServer(ThreadingHTTPServer):
+    """Own the coordinator port exclusively, especially on Windows.
+
+    ``ThreadingHTTPServer`` enables address reuse in current Python releases.
+    On Windows that can let several watchdog-spawned coordinators listen on the
+    same port after one slow health probe.  An exclusive bind turns that race
+    into a clean startup failure instead of a persistent process leak.
+    """
+
+    allow_reuse_address = False
+
+    def server_bind(self) -> None:
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_EXCLUSIVEADDRUSE,
+                1,
+            )
+        super().server_bind()
+
+    def server_close(self) -> None:
+        stop = getattr(self, "maintenance_stop", None)
+        if stop is not None:
+            stop.set()
+        super().server_close()
+
+
+def _positive_env_seconds(name: str, fallback: int) -> int:
+    try:
+        value = int(os.environ.get(name, ""))
+    except ValueError:
+        return fallback
+    return value if value > 0 else fallback
+
+
+def _run_maintenance_once(
+    db: FleetDB, status: Dict[str, Any], *, now: Optional[float] = None
+) -> None:
+    """Run bounded state reclamation and publish a small health summary."""
+    started = time.time() if now is None else now
+    status.update({"running": True, "lastStartedAt": started, "lastError": None})
+    try:
+        result = maintenance_module.sweep(db, now=now)
+        status.update({
+            "running": False,
+            "lastCompletedAt": time.time() if now is None else now,
+            "lastResult": {
+                key: value for key, value in result.items()
+                if key.endswith("_removed") or key.endswith("_abandoned")
+            },
+        })
+    except Exception as exc:  # maintenance must never take routing down
+        status.update({
+            "running": False,
+            "lastFailedAt": time.time() if now is None else now,
+            "lastError": f"{type(exc).__name__}: {exc}",
+        })
+        print(
+            "[ClaudeFleet] automatic maintenance failed: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+
+
+def _maintenance_loop(
+    db: FleetDB,
+    status: Dict[str, Any],
+    stop: threading.Event,
+    initial_delay: int,
+    interval: int,
+) -> None:
+    if stop.wait(initial_delay):
+        return
+    failures = 0
+    while not stop.is_set():
+        status["nextRunAt"] = None
+        _run_maintenance_once(db, status)
+        if status.get("lastError"):
+            failures += 1
+            delay = min(
+                interval,
+                MAINTENANCE_RETRY_MAX_SECONDS,
+                MAINTENANCE_RETRY_BASE_SECONDS * 2 ** min(failures - 1, 3),
+            )
+        else:
+            failures = 0
+            delay = interval
+        status["consecutiveFailures"] = failures
+        status["nextRunAt"] = time.time() + delay
+        if stop.wait(delay):
+            return
 
 
 def _auth_mode() -> str:
@@ -121,6 +220,9 @@ class Coordinator:
         self.control = FleetControl(db)
         self._runtime_sync_lock = threading.Lock()
         self._runtime_signatures: Dict[str, tuple] = {}
+        # Bound abandoned HTTP retries as well as the client-visible wait.
+        # Hundreds of timed-out handlers must not keep mutating the same DB.
+        self.route_slots = threading.BoundedSemaphore(4)
 
     def _identity_collisions(self, accounts: List[Any]) -> set:
         """Two organisations arriving under one key. Refuse both, loudly.
@@ -244,7 +346,7 @@ class Coordinator:
             # TeamClaude reports a cached quota snapshot on every request. Only
             # persist a changed snapshot; otherwise six account transactions per
             # request create a thundering herd under Agent View/Team concurrency.
-            with self._runtime_sync_lock:
+            with self.db.budget_lock(self._runtime_sync_lock):
                 if self._runtime_signatures.get(account_id) != signature:
                     self.control.sync_account_runtime(
                         account_id,
@@ -437,7 +539,11 @@ class CoordinatorHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        except (BrokenPipeError, ConnectionResetError):
+        except (
+            BrokenPipeError,
+            ConnectionResetError,
+            ConnectionAbortedError,
+        ):
             # The client timed out or was cancelled after the decision
             # completed. There is no second response to send and this must not
             # be reclassified as an internal coordinator failure.
@@ -478,7 +584,13 @@ class CoordinatorHandler(BaseHTTPRequestHandler):
         if self.path != "/health":
             self._json(404, {"error": "not_found"})
             return
-        self._json(200, {"ok": True, "time": time.time()})
+        self._json(200, {
+            "ok": True,
+            "time": time.time(),
+            "maintenance": dict(getattr(
+                self.server, "maintenance_status", {"enabled": False}
+            )),
+        })
 
     def do_POST(self) -> None:
         if self.path not in {
@@ -505,8 +617,18 @@ class CoordinatorHandler(BaseHTTPRequestHandler):
             elif self.path == "/v1/pin/check":
                 result = self.server.coordinator.pin_check(payload)  # type: ignore[attr-defined]
             else:
-                result = self.server.coordinator.decide(payload)  # type: ignore[attr-defined]
+                coordinator = self.server.coordinator
+                if not coordinator.route_slots.acquire(blocking=False):
+                    self._json(503, {"error": "coordinator_busy", "message": "Routing queue is busy; retry shortly"})
+                    return
+                try:
+                    with coordinator.db.write_budget(8.0):
+                        result = coordinator.decide(payload)
+                finally:
+                    coordinator.route_slots.release()
             self._json(200, result)
+        except WriteBudgetExceeded:
+            self._json(503, {"error": "coordinator_busy", "message": "Database writer exceeded routing deadline; retry shortly"})
         except FleetError as exc:
             status = 409 if isinstance(exc, NoCapacity) else 422
             self._json(status, {"error": exc.code, "message": str(exc)})
@@ -539,7 +661,38 @@ def serve_coordinator(
         faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)
     except (AttributeError, OSError, RuntimeError, ValueError):
         pass
-    server = ThreadingHTTPServer((host, port), CoordinatorHandler)
-    server.coordinator = Coordinator(FleetDB(db_path))  # type: ignore[attr-defined]
+    db = FleetDB(db_path)
+    server = CoordinatorHTTPServer((host, port), CoordinatorHandler)
+    server.coordinator = Coordinator(db)  # type: ignore[attr-defined]
     server.fleet_token = token  # type: ignore[attr-defined]
+    interval = _positive_env_seconds(
+        "FLEET_MAINTENANCE_INTERVAL_SECONDS",
+        DEFAULT_MAINTENANCE_INTERVAL_SECONDS,
+    )
+    initial_delay = _positive_env_seconds(
+        "FLEET_MAINTENANCE_INITIAL_DELAY_SECONDS",
+        DEFAULT_MAINTENANCE_INITIAL_DELAY_SECONDS,
+    )
+    server.maintenance_status = {  # type: ignore[attr-defined]
+        "enabled": True,
+        "intervalSeconds": interval,
+        "initialDelaySeconds": initial_delay,
+        "running": False,
+        "lastStartedAt": None,
+        "lastCompletedAt": None,
+        "lastError": None,
+        "lastResult": {},
+        "consecutiveFailures": 0,
+        "nextRunAt": time.time() + initial_delay,
+    }
+    server.maintenance_stop = threading.Event()  # type: ignore[attr-defined]
+    thread = threading.Thread(
+        target=_maintenance_loop,
+        args=(db, server.maintenance_status, server.maintenance_stop,
+              initial_delay, interval),
+        name="quotapool-maintenance",
+        daemon=True,
+    )
+    server.maintenance_thread = thread  # type: ignore[attr-defined]
+    thread.start()
     return server
