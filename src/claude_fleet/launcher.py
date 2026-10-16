@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import base64
 import json
+import ntpath
 import os
 import socket
+import subprocess
 import sys
 import urllib.error
 import time
@@ -11,6 +13,9 @@ import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, MutableMapping, Optional, Sequence
+
+from .platform_paths import runtime_path as platform_runtime_path
+from .resource_guard import wait_for_admission
 
 
 FLEET_TRANSPORT_USER_PREFIX = "fleet-holder-v1."
@@ -34,12 +39,7 @@ def encode_transport_holder(holder: str) -> str:
 
 
 def default_runtime_path() -> Path:
-    return Path(
-        os.environ.get(
-            "FLEET_RUNTIME_CONFIG",
-            str(Path.home() / ".config" / "claude-fleet" / "runtime.json"),
-        )
-    ).expanduser()
+    return platform_runtime_path()
 
 
 def load_runtime(path: Optional[str] = None) -> Dict[str, Any]:
@@ -105,7 +105,7 @@ def runtime_portability_problems(runtime: Dict[str, Any]) -> List[Dict[str, Any]
     problems: List[Dict[str, Any]] = []
 
     node_binary = str(runtime.get("node_binary") or "")
-    if node_binary and not os.access(node_binary, os.X_OK):
+    if node_binary and not _is_executable_file(node_binary):
         problems.append({
             "field": "node_binary",
             "value": node_binary,
@@ -138,6 +138,24 @@ def runtime_portability_problems(runtime: Dict[str, Any]) -> List[Dict[str, Any]
     return problems
 
 
+def _is_executable_file(path: str) -> bool:
+    """Check executable-ness without treating every Windows file as runnable.
+
+    Windows' ``os.access(..., X_OK)`` is effectively a readability check for
+    ordinary files. Keep the POSIX permission test for extensionless test and
+    script files, while accepting the executable extensions used by Node and
+    Claude Desktop.
+    """
+    candidate = Path(path)
+    if not candidate.is_file():
+        return False
+    if os.name != "nt":
+        return os.access(path, os.X_OK)
+    if candidate.suffix.lower() in {".exe", ".com", ".cmd", ".bat"}:
+        return True
+    return bool(candidate.stat().st_mode & 0o111) and os.access(path, os.X_OK)
+
+
 def _proxy_endpoint(url: str) -> tuple:
     from urllib.parse import urlparse
 
@@ -168,10 +186,14 @@ def _replace_header(existing: str, name: str, value: Optional[str]) -> str:
 
 
 def _prepend_fleet_shim(path: str, runtime: Dict[str, Any]) -> str:
+    configured = str(runtime.get("shim_dir") or "").strip()
     prefix = str(runtime.get("prefix") or "").strip()
-    if not prefix:
+    if not configured and not prefix:
         return path
-    shim = str(Path(prefix).expanduser() / "shims")
+    shim = str(
+        Path(configured).expanduser()
+        if configured else Path(prefix).expanduser() / "shims"
+    )
     entries = [
         entry for entry in path.split(os.pathsep)
         if entry and entry != shim
@@ -342,6 +364,19 @@ def dataplane_endpoint(runtime: Dict[str, Any]) -> str:
 SERVICE_CHECK_ATTEMPTS = 4
 SERVICE_CHECK_BACKOFF_SECONDS = 2.0
 
+_DEFAULT_URLOPEN = urllib.request.urlopen
+_DIRECT_SERVICE_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({})
+)
+
+
+def _service_urlopen(url: str, timeout: float):
+    """Open a health URL directly while preserving the public test seam."""
+    current = urllib.request.urlopen
+    if current is not _DEFAULT_URLOPEN:
+        return current(url, timeout=timeout)
+    return _DIRECT_SERVICE_OPENER.open(url, timeout=timeout)
+
 
 def check_services(runtime: Dict[str, Any]) -> None:
     # Both probes ask one question: is the service answering? Neither asks it
@@ -361,6 +396,12 @@ def check_services(runtime: Dict[str, Any]) -> None:
         ("coordinator", f"{coordinator_endpoint(runtime)}/health"),
         ("TeamClaude", f"{dataplane_endpoint(runtime)}/teamclaude/ready"),
     ]
+    # Service readiness is a direct reachability check. In particular, a
+    # loopback target must never be answered by the user's desktop proxy: some
+    # proxies return an HTTP error for an unreachable port, and HTTP errors are
+    # intentionally accepted below as proof that a service answered. Using an
+    # explicit no-proxy opener prevents that false positive and also keeps the
+    # launch gate independent of ambient HTTP_PROXY/HTTPS_PROXY settings.
     # Retry briefly before refusing. Failing closed is right — starting Claude
     # unfenced is worse than not starting it — but a service restart takes about
     # four seconds, and refusing on the FIRST failed probe turns a routine
@@ -377,7 +418,7 @@ def check_services(runtime: Dict[str, Any]) -> None:
         last = None
         for attempt in range(SERVICE_CHECK_ATTEMPTS):
             try:
-                with urllib.request.urlopen(url, timeout=2) as response:
+                with _service_urlopen(url, timeout=2) as response:
                     if response.status != 200:
                         raise RuntimeError(
                             f"{name} at {url} returned HTTP {response.status}"
@@ -432,6 +473,10 @@ def exec_wrapped(
         raise RuntimeError("processWrapper received no target command")
     runtime = load_runtime(runtime_path)
     check_services(runtime)
+    wait_for_admission(
+        runtime,
+        workload_class or os.environ.get("FLEET_WORKLOAD_CLASS"),
+    )
     command = list(command)
     if command[0] == "claude" and runtime.get("claude_binary"):
         command[0] = str(runtime["claude_binary"])
@@ -446,8 +491,13 @@ def exec_wrapped(
         launch_id=launch_id,
         new_launch=new_launch,
     )
-    # Claude requires the wrapper to replace itself, not leave an intermediate
-    # supervisor process.
+    # Unix can replace the wrapper exactly. Windows has no execve-equivalent;
+    # Python's os.exec* family starts a child there and exits immediately,
+    # losing the child's real exit code. Keep the small launcher alive and
+    # forward the result instead. The Desktop corporate-launcher contract
+    # permits this shape on Windows.
+    if os.name == "nt":
+        raise SystemExit(subprocess.call(command, env=env))
     os.execvpe(command[0], command, env)
 
 

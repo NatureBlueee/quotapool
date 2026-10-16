@@ -38,6 +38,12 @@ def test_repeat_ensure_returns_the_same_execution(control):
     assert first["id"] == second["id"]
 
 
+def test_desktop_workload_is_scheduled_as_interactive(control):
+    execution = control.ensure_execution("desktop-session", workload_class="desktop")
+
+    assert execution["workload_class"] == "interactive"
+
+
 def test_repeat_ensure_with_a_hint_is_idempotent(control):
     first = control.ensure_execution(
         "s1", execution_hint="exec-abc123", workload_class="interactive"

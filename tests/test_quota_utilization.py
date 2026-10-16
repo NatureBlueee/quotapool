@@ -75,6 +75,98 @@ def test_load_still_breaks_a_tie_between_equal_accounts(control):
     assert route["account_id"] == "b"
 
 
+def test_severe_load_skew_cannot_starve_a_healthy_account(control, monkeypatch):
+    """A rolling plan must eventually commit to the account it keeps saving.
+
+    This reproduces the live max-4 shape: a healthy account already carries
+    many active task families while a full, later-resetting account remains
+    idle.  The old receding horizon always planned to use the idle account
+    later, then moved that later slot forward on every new request forever.
+    """
+    now = time.time()
+    # There is enough observed demand to spend the current window before its
+    # reset, so a modest balancing deviation does not endanger expiring quota.
+    monkeypatch.setattr(control, "_forecast", lambda *a, **kw: (0.2, 0.2, False))
+    control.upsert_account("busy")
+    control.upsert_account("idle")
+    quota(control, "busy", weekly=0.2, five_hour=0.1,
+          weekly_reset=now + 3 * 24 * HOUR, five_reset=now + 2 * HOUR)
+    quota(control, "idle", weekly=0.0, five_hour=0.0,
+          weekly_reset=now + 5 * 24 * HOUR, five_reset=now + 5 * HOUR)
+
+    for index in range(8):
+        session = f"busy-{index}"
+        holder = f"holder-{index}"
+        control.register_execution(session, workload_class="interactive")
+        generation = control.acquire_writer(session, holder)
+        control.set_route_policy(session, "pin", "busy")
+        control.decide_route(session, holder, generation)
+
+    control.register_execution("new", workload_class="interactive")
+    generation = control.acquire_writer("new", "holder-new")
+    route = control.decide_route("new", "holder-new", generation)
+
+    assert route["account_id"] == "idle"
+    assert route["reason"] == "anti_starvation"
+    assert route["optimizer"]["planned_account_id"] == "busy"
+    assert route["optimizer"]["dynamic_policy"]["action"] == "balance_new_session"
+
+
+def test_severe_skew_does_not_divert_endangered_expiring_capacity(control):
+    now = time.time()
+    control.upsert_account("soon")
+    control.upsert_account("later")
+    quota(control, "soon", weekly=0.58, five_hour=0.75,
+          weekly_reset=now + HOUR / 2, five_reset=now + 2 * HOUR)
+    quota(control, "later", weekly=0.14, five_hour=0.0,
+          weekly_reset=now + 16 * HOUR, five_reset=now + 5 * HOUR)
+    for index in range(8):
+        session, holder = f"urgent-{index}", f"holder-{index}"
+        control.register_execution(session, workload_class="interactive")
+        generation = control.acquire_writer(session, holder)
+        control.set_route_policy(session, "pin", "soon")
+        control.decide_route(session, holder, generation)
+    control.register_execution("new", workload_class="interactive")
+    generation = control.acquire_writer("new", "holder-new")
+    route = control.decide_route("new", "holder-new", generation)
+    assert route["account_id"] == "soon"
+    policy = route["optimizer"]["dynamic_policy"]
+    assert policy["action"] == "protect_expiring_capacity"
+    assert policy["expiry_pressure"]["soon"]["bucket"] == "weekly"
+    assert policy["expiry_pressure"]["soon"]["at_risk_weekly_fraction"] > 0
+
+
+def test_forecast_cache_reuses_observed_history(control, monkeypatch):
+    calls = []
+
+    def fake_forecast(rows, *, active_families, now):
+        calls.append((list(rows), active_families, now))
+        return (0.18, 0.03, False)
+
+    monkeypatch.setattr("claude_fleet.control.estimate_forecast", fake_forecast)
+    with control.db.connect() as conn:
+        first = control._forecast(conn, active_families=2, now=1000.0)
+        second = control._forecast(conn, active_families=9, now=1059.0)
+
+    assert first == second == (0.18, 0.03, False)
+    assert len(calls) == 1
+
+
+def test_default_forecast_cache_tracks_active_family_count(control, monkeypatch):
+    calls = []
+
+    def fake_forecast(rows, *, active_families, now):
+        calls.append(active_families)
+        return (0.18, active_families * 0.001, True)
+
+    monkeypatch.setattr("claude_fleet.control.estimate_forecast", fake_forecast)
+    with control.db.connect() as conn:
+        control._forecast(conn, active_families=2, now=1000.0)
+        control._forecast(conn, active_families=3, now=1001.0)
+
+    assert calls == [2, 3]
+
+
 def test_priority_still_outranks_urgency(control):
     """Operator policy is above the automatic objective, and stays there."""
     now = time.time()

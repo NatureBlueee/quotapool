@@ -76,7 +76,11 @@ fi
 FLEET_GROUP=$(id -gn "$FLEET_USER")
 
 BIN_DIR="$FLEET_HOME/.local/bin"
-RUNTIME="$FLEET_HOME/.config/claude-fleet/runtime.json"
+if [ -d "$FLEET_HOME/.config/claude-fleet" ]; then
+  RUNTIME="$FLEET_HOME/.config/claude-fleet/runtime.json"
+else
+  RUNTIME="$FLEET_HOME/.config/quotapool/runtime.json"
+fi
 
 [ -r "$RUNTIME" ] || {
   printf '%s\n' \
@@ -93,6 +97,11 @@ read_runtime() {
 DB_PATH=$(read_runtime db_path)
 [ -n "$DB_PATH" ] || {
   printf '%s\n' "install-systemd.sh: runtime.json has no db_path" >&2
+  exit 78
+}
+PROJECT_PREFIX=$(read_runtime prefix)
+[ -n "$PROJECT_PREFIX" ] || {
+  printf '%s\n' "install-systemd.sh: runtime.json has no prefix" >&2
   exit 78
 }
 STATE_DIR=$(dirname "$DB_PATH")
@@ -115,7 +124,7 @@ emit_unit() {
 $MARKER
 [Unit]
 Description=Claude Fleet coordinator (route, writer fencing, policy)
-Documentation=file://$FLEET_HOME/.local/share/claude-fleet/ARCHITECTURE.md
+Documentation=file://$PROJECT_PREFIX/ARCHITECTURE.md
 After=network-online.target
 Wants=network-online.target
 # StartLimit* belong in [Unit] since systemd v229. In [Service] they are unknown
@@ -168,7 +177,7 @@ EOF
 $MARKER
 [Unit]
 Description=Claude Fleet data plane (TeamClaude OAuth/MITM/SSE, loopback)
-Documentation=file://$FLEET_HOME/.local/share/claude-fleet/ARCHITECTURE.md
+Documentation=file://$PROJECT_PREFIX/ARCHITECTURE.md
 # Coordinator transport failure is fail-closed, so starting without it only
 # produces held requests. Ordering, not a hard requirement.
 After=network-online.target claude-fleet-coordinator.service
@@ -211,7 +220,7 @@ EOF
 $MARKER
 [Unit]
 Description=Claude Fleet state retention sweep
-Documentation=file://$FLEET_HOME/.local/share/claude-fleet/packaging/systemd/README.md
+Documentation=file://$PROJECT_PREFIX/packaging/systemd/README.md
 
 [Service]
 Type=oneshot
@@ -255,7 +264,7 @@ EOF
 $MARKER
 [Unit]
 Description=Claude Fleet token collector
-Documentation=file://$FLEET_HOME/.local/share/claude-fleet/packaging/systemd/README.md
+Documentation=file://$PROJECT_PREFIX/packaging/systemd/README.md
 
 [Service]
 Type=oneshot
@@ -263,7 +272,7 @@ User=$FLEET_USER
 Group=$FLEET_GROUP
 Environment=HOME=$FLEET_HOME
 Environment=FLEET_RUNTIME_CONFIG=$RUNTIME
-ExecStart=$FLEET_HOME/.local/share/claude-fleet/scripts/fleet-tokens --collect --quiet
+ExecStart=$PROJECT_PREFIX/scripts/fleet-tokens --collect --quiet
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict

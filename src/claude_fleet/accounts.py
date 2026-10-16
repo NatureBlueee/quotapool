@@ -117,11 +117,16 @@ def _write_credentials(path: Path, account_id: str, mode: str) -> Dict[str, Any]
         except BaseException:
             temp.unlink(missing_ok=True)
             raise
-        dir_fd = os.open(str(path.parent), os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+        # POSIX lets us fsync the containing directory to make the rename
+        # durable. Windows rejects opening a directory as a normal file; the
+        # file's own FlushFileBuffers (via fsync above) is the supported
+        # durability boundary there.
+        if os.name != "nt":
+            dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
         return matched
     finally:
         os.close(lock_fd)

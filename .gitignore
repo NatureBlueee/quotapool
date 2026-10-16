@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
+.venv/
+*.egg-info/
 
 # A stray state database. cli.py's default_db() falls back to
 # ./work/claude-fleet.sqlite3 when there is no runtime config, so any command run

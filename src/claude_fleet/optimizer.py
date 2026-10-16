@@ -28,6 +28,9 @@ DEADLINE_LEXICOGRAPHIC_SCALE = 1000
 # between accounts whose windows expire at the same time, and cannot outvote
 # even 30 minutes of genuine urgency.
 ACTIVE_FAMILY_LOAD_COST = 500
+# A manual weight is a bounded tie-breaker, never a replacement for eligibility,
+# operator priority or a 30-minute quota-expiry difference (1,000 cost units).
+MAX_ROUTING_WEIGHT_BIAS = 400
 INF = 10**9
 
 
@@ -41,6 +44,54 @@ class OptimizationAccount:
     priority: int = 0
     five_floor: float = 0
     active_families: int = 0
+    routing_weight: int = 1
+
+
+def expiry_pressure(
+    account: OptimizationAccount, *, now: float,
+    five_to_weekly_capacity: float, weekly_burn_per_hour: float,
+) -> Dict[str, Any]:
+    """Estimate reachable quota at risk within one rolling 5h window.
+
+    Compare against the ENTIRE fleet's forecast demand: if even all that work
+    cannot consume this capacity in time, diverting it for load balance wastes
+    quota. Unknown/past deadlines confer no urgency. This is a forecast, not
+    permission to exceed observed quotas or reserve floors.
+    """
+    ratio = max(0.03, min(1.0, five_to_weekly_capacity))
+    current_capacity = min(
+        _bounded(account.weekly_remaining),
+        _bounded(account.five_remaining) * ratio,
+    )
+    windows = []
+    five_end = account.five_reset_at
+    weekly_end = account.weekly_reset_at
+    if five_end and now < five_end <= now + 5 * 3600:
+        windows.append((five_end, "five_hour", current_capacity))
+    if weekly_end and now < weekly_end <= now + 5 * 3600:
+        capacity = current_capacity
+        # Only count a renewal when its observed deadline is still in future
+        # and strictly before the weekly reset. Do not invent missing clocks.
+        if five_end and now < five_end < weekly_end:
+            capacity += (1.0 - _bounded(account.five_floor)) * ratio
+        windows.append((weekly_end, "weekly", min(
+            _bounded(account.weekly_remaining), capacity,
+        )))
+    risks = []
+    for deadline, bucket, capacity in windows:
+        demand = max(0.0, weekly_burn_per_hour) * (deadline - now) / 3600
+        at_risk = max(0.0, capacity - demand)
+        # The upstream reports quota at 1% resolution; smaller differences
+        # cannot justify overriding a normal balancing decision.
+        if at_risk >= 1.0 / QUANTA_PER_WEEKLY_WINDOW:
+            risks.append({
+                "bucket": bucket, "reset_at": deadline,
+                "seconds_to_reset": round(deadline - now, 3),
+                "spendable_weekly_fraction": round(capacity, 6),
+                "forecast_demand_fraction": round(demand, 6),
+                "at_risk_weekly_fraction": round(at_risk, 6),
+            })
+    return min(risks, key=lambda item: item["reset_at"]) if risks else {}
 
 
 @dataclass(frozen=True)
@@ -193,6 +244,47 @@ def _bounded(value: Optional[float]) -> float:
     return max(0.0, min(1.0, float(value or 0)))
 
 
+FORECAST_SAMPLE_SECONDS = 5 * 60
+
+
+def _compact_forecast_samples(
+    values: Sequence[Tuple[float, Optional[float], Optional[float]]],
+) -> List[Tuple[float, Optional[float], Optional[float]]]:
+    """Keep the first and last quota reading in each five-minute bucket.
+
+    Route traffic can produce thousands of distinct fractional readings per
+    account in six hours.  Forecasting compares pairs at least fifteen minutes
+    apart, so every intermediate sub-five-minute point adds quadratic work but
+    no useful time resolution.  Keeping both bucket edges preserves resets and
+    boundary movement while placing a hard bound on the pairwise estimator.
+    """
+    compacted: List[Tuple[float, Optional[float], Optional[float]]] = []
+    bucket_first: Optional[
+        Tuple[float, Optional[float], Optional[float]]
+    ] = None
+    bucket_last: Optional[
+        Tuple[float, Optional[float], Optional[float]]
+    ] = None
+    bucket_id: Optional[int] = None
+
+    def flush() -> None:
+        if bucket_first is None:
+            return
+        compacted.append(bucket_first)
+        if bucket_last is not None and bucket_last != bucket_first:
+            compacted.append(bucket_last)
+
+    for value in values:
+        current_bucket = int(value[0] // FORECAST_SAMPLE_SECONDS)
+        if current_bucket != bucket_id:
+            flush()
+            bucket_id = current_bucket
+            bucket_first = value
+        bucket_last = value
+    flush()
+    return compacted
+
+
 def estimate_forecast(
     event_rows: Iterable[Mapping[str, Any]],
     *,
@@ -236,6 +328,7 @@ def estimate_forecast(
             if unique and value[1:] == unique[-1][1:]:
                 continue
             unique.append(value)
+        unique = _compact_forecast_samples(unique)
         weekly_candidates: List[Tuple[float, float]] = []
         ratio_candidates: List[Tuple[float, float, float]] = []
         for left_index, left in enumerate(unique):
@@ -348,6 +441,7 @@ def solve_rolling_horizon(
         flow.edge(slot_nodes[slot_index], sink, units, slot_index)
 
     minimum_priority = min(account.priority for account in usable)
+    maximum_weight = max(max(1, min(10, account.routing_weight)) for account in usable)
     for account in sorted(usable, key=lambda item: item.account_id):
         weekly_end = min(
             account.weekly_reset_at or now + HORIZON_SECONDS,
@@ -360,6 +454,11 @@ def solve_rolling_horizon(
             continue
         weekly_node = flow.node()
         priority_cost = max(0, account.priority - minimum_priority) * 1_000_000
+        weight = max(1, min(10, account.routing_weight))
+        weight_cost = round(MAX_ROUTING_WEIGHT_BIAS * (1 - weight / maximum_weight))
+        weighted_load_cost = round(
+            max(0, account.active_families) * ACTIVE_FAMILY_LOAD_COST / weight
+        )
         preference_cost = (
             0
             if not preferred_account or account.account_id == preferred_account
@@ -372,7 +471,7 @@ def solve_rolling_horizon(
             weekly_capacity,
             priority_cost
             + preference_cost
-            + max(0, account.active_families) * ACTIVE_FAMILY_LOAD_COST,
+            + weight_cost + weighted_load_cost,
         )
 
         cycle_start = now

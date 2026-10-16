@@ -34,9 +34,24 @@ def main() -> int:
     parser.add_argument("--claude-binary", required=True)
     parser.add_argument("--token", required=True)
     parser.add_argument("--node-binary", required=True)
+    parser.add_argument("--shim-dir", default="")
+    parser.add_argument("--desktop-wrapper", default="")
+    parser.add_argument("--desktop-pid-file", default="")
     parser.add_argument("--outbound-proxy", default="")
     parser.add_argument("--no-proxy", default="")
+    parser.add_argument("--proxy-port", type=int, default=13456)
+    parser.add_argument("--coordinator-port", type=int, default=17891)
+    parser.add_argument("--ca-path", default="")
     args = parser.parse_args()
+
+    for name, port in (
+        ("proxy", args.proxy_port),
+        ("coordinator", args.coordinator_port),
+    ):
+        if not 1 <= port <= 65535:
+            parser.error(f"{name} port must be between 1 and 65535")
+    if args.proxy_port == args.coordinator_port:
+        parser.error("proxy and coordinator ports must be different")
 
     config_dir = Path(args.config_dir).expanduser()
     state_dir = Path(args.state_dir).expanduser()
@@ -52,7 +67,7 @@ def main() -> int:
         else {}
     )
     coordinator_token = existing_coordinator.get("token") or args.token
-    proxy.update({"port": 13456, "host": "127.0.0.1"})
+    proxy.update({"port": args.proxy_port, "host": "127.0.0.1"})
     team.update({
         "proxy": proxy,
         "upstream": "https://api.anthropic.com",
@@ -76,7 +91,7 @@ def main() -> int:
         },
         "fleetCoordinator": {
             "enabled": True,
-            "url": "http://127.0.0.1:17891",
+            "url": f"http://127.0.0.1:{args.coordinator_port}",
             # Reinstalling binaries must not silently split the running data
             # plane and coordinator onto different tokens. Rotation is a
             # separate, explicit operation with an ordered service restart.
@@ -94,18 +109,50 @@ def main() -> int:
                 "this would create a recursive launcher"
             )
         requested_claude = str(previous_claude)
+    requested_ca = args.ca_path.strip()
+    existing_ca = str(existing_runtime.get("ca_path") or "").strip()
+    ca_path = (
+        str(Path(requested_ca).expanduser())
+        if requested_ca
+        else (
+            str(Path(existing_ca).expanduser())
+            if existing_ca and Path(existing_ca).expanduser().is_file()
+            else str(config_dir / "teamclaude-ca.pem")
+        )
+    )
     runtime = {
         "version": 1,
         "prefix": str(Path(args.prefix).expanduser()),
         "claude_binary": requested_claude,
         "node_binary": args.node_binary,
-        "proxy_port": 13456,
-        "coordinator_port": 17891,
-        "ca_path": str(config_dir / "teamclaude-ca.pem"),
+        "proxy_port": args.proxy_port,
+        "coordinator_port": args.coordinator_port,
+        # A Windows wrapper can deliberately trust the CA presented by a WSL
+        # data plane. Reinstalling the desktop adapter must not silently point
+        # it back at the unrelated Windows-local CA and break every request.
+        "ca_path": ca_path,
         "hold_seconds": 21600,
         "db_path": str(state_dir / "fleet.sqlite3"),
         "teamclaude_config": str(team_path),
+        "resource_guard": (
+            existing_runtime.get("resource_guard")
+            if isinstance(existing_runtime.get("resource_guard"), dict)
+            else {
+                "enabled": True,
+                "freshness_seconds": 75,
+                "poll_seconds": 5,
+                "max_wait_seconds": 900,
+            }
+        ),
     }
+    if args.shim_dir.strip():
+        runtime["shim_dir"] = str(Path(args.shim_dir).expanduser())
+    if args.desktop_wrapper.strip():
+        runtime["desktop_wrapper"] = str(Path(args.desktop_wrapper).expanduser())
+    if args.desktop_pid_file.strip():
+        runtime["desktop_pid_file"] = str(
+            Path(args.desktop_pid_file).expanduser()
+        )
     outbound_proxy = (
         args.outbound_proxy.strip()
         or str(existing_runtime.get("outbound_proxy") or "").strip()

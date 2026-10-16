@@ -13,6 +13,7 @@ from .db import FleetDB, json_dump, json_load
 from .optimizer import (
     OptimizationAccount,
     estimate_forecast,
+    expiry_pressure,
     solve_rolling_horizon,
 )
 
@@ -48,6 +49,17 @@ WORKLOADS = {
     "agent-view",
     "fork",
 }
+
+# Claude Desktop labels its local sessions as ``desktop`` so the launch path
+# remains observable, but scheduling semantics are identical to a person at an
+# interactive terminal. Canonicalize at the control boundary so account
+# allow-lists and the interactive reserve keep their existing meaning.
+WORKLOAD_ALIASES = {"desktop": "interactive"}
+
+
+def canonical_workload_class(value: str) -> str:
+    workload = str(value or "interactive").strip() or "interactive"
+    return WORKLOAD_ALIASES.get(workload, workload)
 
 # Work that can wait for a later request boundary without a person noticing.
 #
@@ -86,6 +98,18 @@ WRITER_TTL_SECONDS = 24 * 60 * 60
 # it pointed the wrong way — and at 20 points per family in `_score` a gap that
 # size buries every other term.
 ACTIVE_LOAD_WINDOW_SECONDS = 30 * 60
+
+# A receding-horizon plan can keep postponing the same idle account forever:
+# every solve reserves that account for a later slot, then the next request
+# rebuilds the horizon and reserves it for "later" again.  The optimizer still
+# owns normal quota-expiry decisions; this guard only applies to a brand-new
+# session when the planned account is already carrying a materially larger
+# number of active writer families.  Eight is deliberately well above the
+# one-family difference covered by the ordinary load tie-break. The expiry
+# pressure guard additionally vetoes balancing away from reachable capacity
+# that the fleet's forecast cannot consume before its earlier reset.
+ANTI_STARVATION_LOAD_GAP = 8
+ANTI_STARVATION_MIN_REMAINING = 0.20
 
 # How much of a weekly window an ESTABLISHED session must still see in front of
 # it to keep using the account it is on.
@@ -224,6 +248,13 @@ def expire_stale_windows(conn: sqlite3.Connection, now: float) -> int:
     return changed
 RESET_RECONCILE_INTERVAL_SECONDS = 30
 OPTIMIZER_CACHE_SECONDS = 5
+# Forecasting walks six hours of quota samples and compares each account's
+# distinct readings pairwise.  The output is a slow-moving demand estimate,
+# not live eligibility state, so recomputing it on every five-second optimizer
+# cache boundary only creates coordinator lock convoys.  Keep route plans on
+# their existing five-second cadence while reusing the expensive forecast for
+# one minute.
+FORECAST_CACHE_SECONDS = 60
 ROUTE_REOPTIMIZE_SECONDS = 60
 WRITER_RENEW_MARGIN_SECONDS = 60 * 60
 # SQLite stores a required integer for policy compatibility with explicit
@@ -308,6 +339,10 @@ class FleetControl:
         self._timing = threading.local()
         self._optimizer_cache_lock = threading.Lock()
         self._optimizer_cache: Dict[tuple, Any] = {}
+        self._forecast_cache_lock = threading.Lock()
+        self._forecast_cache: Optional[
+            Tuple[float, int, Tuple[float, float, bool]]
+        ] = None
         self._route_reoptimize_lock = threading.Lock()
         self._route_reoptimize_at: Dict[str, float] = {}
         # (session_id, account_id) → 上次因提前换号离开它的时刻。见常量处的说明。
@@ -324,11 +359,52 @@ class FleetControl:
         """
         if now - self._last_reset_reconcile < RESET_RECONCILE_INTERVAL_SECONDS:
             return
-        with self._reset_reconcile_lock:
+        with self.db.budget_lock(self._reset_reconcile_lock):
             if now - self._last_reset_reconcile < RESET_RECONCILE_INTERVAL_SECONDS:
                 return
             self.reconcile_resets(now)
             self._last_reset_reconcile = now
+
+    def _forecast(
+        self,
+        conn: Any,
+        *,
+        active_families: int,
+        now: float,
+    ) -> Tuple[float, float, bool]:
+        """Return a bounded-age demand forecast without blocking every route.
+
+        Eligibility and quota values are deliberately absent from this cache:
+        they remain inputs to the five-second optimizer plan.  Only the
+        historical burn estimate is reused.  When history is insufficient the
+        fallback depends on active-family count, so that case is cached only
+        while the count is unchanged.
+        """
+        with self._forecast_cache_lock:
+            cached = self._forecast_cache
+            if cached is not None:
+                cached_at, cached_families, result = cached
+                if (
+                    now - cached_at < FORECAST_CACHE_SECONDS
+                    and (not result[2] or cached_families == active_families)
+                ):
+                    return result
+            event_rows = conn.execute(
+                """
+                SELECT at,subject,payload
+                FROM events
+                WHERE kind='account.runtime_synced' AND at>=?
+                ORDER BY seq
+                """,
+                (now - 6 * 60 * 60,),
+            ).fetchall()
+            result = estimate_forecast(
+                event_rows,
+                active_families=active_families,
+                now=now,
+            )
+            self._forecast_cache = (now, active_families, result)
+            return result
 
     def upsert_account(
         self,
@@ -764,6 +840,7 @@ class FleetControl:
         workload_id: Optional[str] = None,
         parent_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        workload_class = canonical_workload_class(workload_class)
         if workload_class not in WORKLOADS:
             raise FleetError(f"unknown workload class {workload_class!r}")
         execution_id = execution_id or f"exec-{uuid.uuid4().hex[:12]}"
@@ -952,6 +1029,7 @@ class FleetControl:
         actual_session_id = str(actual_session_id or "").strip()
         if not execution_hint or not actual_session_id:
             raise FleetError("execution_hint and actual_session_id are required")
+        workload_class = canonical_workload_class(workload_class)
         if workload_class not in WORKLOADS:
             raise FleetError(f"unknown workload class {workload_class!r}")
         now = time.time()
@@ -1704,6 +1782,12 @@ class FleetControl:
         return True, "ok"
 
     @staticmethod
+    def _routing_weight(account: sqlite3.Row) -> int:
+        metadata = json_load(account["metadata"], {})
+        raw = metadata.get("routing_weight", 1) if isinstance(metadata, dict) else 1
+        return raw if type(raw) is int and 1 <= raw <= 10 else 1
+
+    @staticmethod
     def _score(
         account: sqlite3.Row,
         now: float,
@@ -1713,7 +1797,9 @@ class FleetControl:
         score = -float(account["priority"]) * 100
         if account["id"] == preferred:
             score += 10000
-        score -= active_count * 20
+        routing_weight = FleetControl._routing_weight(account)
+        score += (routing_weight - 1) * 10
+        score -= active_count * 20 / routing_weight
         # Capacity that will expire soon is more urgent. This is a rolling
         # heuristic, not a claim of exact token prediction.
         for used_key, reset_key, floor_key, weight in (
@@ -2151,6 +2237,7 @@ class FleetControl:
                         weekly_remaining=weekly_remaining,
                         weekly_reset_at=account["weekly_reset_at"],
                         priority=int(account["priority"]),
+                        routing_weight=self._routing_weight(account),
                         five_floor=float(account["five_hour_floor"]),
                         active_families=effective_load_counts.get(
                             account_id,
@@ -2234,6 +2321,7 @@ class FleetControl:
                                 item.weekly_remaining,
                                 item.weekly_reset_at,
                                 item.priority,
+                                item.routing_weight,
                                 item.five_floor,
                             )
                             for item in optimization_accounts
@@ -2248,17 +2336,8 @@ class FleetControl:
                         if cache_key in self._optimizer_cache:
                             solution = self._optimizer_cache[cache_key]
                         else:
-                            event_rows = conn.execute(
-                                """
-                                SELECT at,subject,payload
-                                FROM events
-                                WHERE kind='account.runtime_synced' AND at>=?
-                                ORDER BY seq
-                                """,
-                                (now - 6 * 60 * 60,),
-                            ).fetchall()
-                            ratio, burn, used_default = estimate_forecast(
-                                event_rows,
+                            ratio, burn, used_default = self._forecast(
+                                conn,
                                 active_families=active_families,
                                 now=now,
                             )
@@ -2285,6 +2364,95 @@ class FleetControl:
                             if current_account == chosen
                             else "rolling_optimal"
                         )
+                        # Receding-horizon anti-starvation for NEW sessions.
+                        #
+                        # The exact plan may repeatedly put a quiet account in
+                        # a future slot while choosing an already-busy account
+                        # now.  Because the next request creates a fresh horizon,
+                        # that future slot never arrives.  Once the load skew is
+                        # severe, assigning one new family to the quiet account
+                        # is a bounded deviation that preserves existing-session
+                        # cache affinity and cannot send work into a nearly spent
+                        # bucket.
+                        if current_account is None:
+                            planned = next(
+                                (
+                                    item
+                                    for item in optimization_accounts
+                                    if item.account_id == solution.account_id
+                                ),
+                                None,
+                            )
+                            quiet = [
+                                item
+                                for item in optimization_accounts
+                                if item.account_id != solution.account_id
+                                and item.five_remaining
+                                >= ANTI_STARVATION_MIN_REMAINING
+                                and item.weekly_remaining
+                                >= ANTI_STARVATION_MIN_REMAINING
+                                and planned is not None
+                                and planned.active_families / planned.routing_weight
+                                - item.active_families / item.routing_weight
+                                >= ANTI_STARVATION_LOAD_GAP
+                            ]
+                            pressure = {
+                                item.account_id: expiry_pressure(
+                                    item, now=now,
+                                    five_to_weekly_capacity=solution.five_to_weekly_capacity,
+                                    weekly_burn_per_hour=solution.weekly_burn_per_hour,
+                                )
+                                for item in optimization_accounts
+                            }
+                            planned_pressure = pressure.get(solution.account_id, {})
+                            # Do not let a fixed load-gap override capacity
+                            # that even the whole fleet cannot spend before
+                            # reset. Balance among equally urgent accounts,
+                            # but preserve the earlier endangered window.
+                            balanceable = [
+                                item for item in quiet
+                                if not planned_pressure
+                                or (pressure[item.account_id] and
+                                    pressure[item.account_id]["reset_at"]
+                                    <= planned_pressure["reset_at"])
+                            ]
+                            optimization["dynamic_policy"] = {
+                                "action": (
+                                    "protect_expiring_capacity"
+                                    if quiet and not balanceable
+                                    else "balance_new_session" if balanceable
+                                    else "follow_plan"
+                                ),
+                                "forecast_source": (
+                                    "default" if solution.used_default_forecast
+                                    else "observed"
+                                ),
+                                "expiry_pressure": pressure,
+                            }
+                            if balanceable:
+                                alternative = min(
+                                    balanceable,
+                                    key=lambda item: (
+                                        item.active_families / item.routing_weight,
+                                        item.weekly_reset_at or float("inf"),
+                                        item.account_id,
+                                    ),
+                                )
+                                chosen = alternative.account_id
+                                optimization["planned_account_id"] = (
+                                    solution.account_id
+                                )
+                                optimization["account_id"] = chosen
+                                optimization["anti_starvation"] = {
+                                    "load_gap": (
+                                        planned.active_families
+                                        - alternative.active_families
+                                    ),
+                                    "minimum_remaining": (
+                                        ANTI_STARVATION_MIN_REMAINING
+                                    ),
+                                }
+                                reason = "anti_starvation"
                 if candidates:
                     if chosen is None:
                         candidates.sort(key=lambda item: (-item[0], item[1]))

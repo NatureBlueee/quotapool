@@ -175,6 +175,36 @@ def _port_open(port: int) -> bool:
 
 
 def _private(path: Path) -> Optional[bool]:
+    if os.name == "nt":
+        # Windows does not expose POSIX mode bits as an ACL. Files created
+        # below the per-user AppData roots inherit the user's private ACL by
+        # default; reject an explicitly broad ACL when icacls can inspect it.
+        if not path.is_file():
+            return None
+        try:
+            import subprocess
+
+            result = subprocess.run(
+                ["icacls", str(path)],
+                capture_output=True,
+                text=True,
+                encoding="mbcs",
+                errors="replace",
+                timeout=5,
+                check=False,
+            )
+            text = result.stdout.lower()
+            broad = ("\\everyone:" in text or " everyone:" in text
+                     or "\\users:" in text or " builtin\\users:" in text)
+            return result.returncode == 0 and not broad
+        except (OSError, subprocess.SubprocessError):
+            # If ACL inspection is unavailable, retain the safe per-user path
+            # invariant used by the Windows installer.
+            profile = Path(os.environ.get("USERPROFILE", "")).resolve()
+            try:
+                return profile in path.resolve().parents
+            except OSError:
+                return False
     try:
         mode = stat.S_IMODE(path.stat().st_mode)
         return mode & 0o077 == 0
@@ -196,6 +226,14 @@ def _wrapper_drift(runtime: Dict[str, Any]) -> Tuple[bool, Any]:
     restores the repository would leave the drifted copy running. So compare
     them, and say which ones differ.
     """
+    if os.name == "nt":
+        # Windows entry points are installed into the venv's Scripts folder;
+        # the Unix ~/.local/bin comparison below is not applicable.
+        wrapper = Path(str(runtime.get("desktop_wrapper") or ""))
+        return (wrapper.is_file(),
+                "Windows venv Scripts entry points are active"
+                if wrapper.is_file() else str(wrapper))
+
     prefix = str(runtime.get("prefix") or "")
     if not prefix:
         return True, "no prefix in runtime config"

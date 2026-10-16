@@ -22,6 +22,7 @@ from __future__ import annotations
 import time
 
 from claude_fleet.optimizer import (
+    _compact_forecast_samples,
     ACTIVE_FAMILY_LOAD_COST,
     DEADLINE_LEXICOGRAPHIC_SCALE,
     OptimizationAccount,
@@ -29,12 +30,27 @@ from claude_fleet.optimizer import (
 )
 
 
+def test_dense_forecast_history_is_bounded_to_bucket_edges():
+    start = 999_900.0  # exact five-minute boundary
+    values = [
+        (start + second, second / 100_000, second / 200_000)
+        for second in range(0, 30 * 60, 10)
+    ]
+
+    compacted = _compact_forecast_samples(values)
+
+    # Six five-minute buckets, with their first and last readings retained.
+    assert len(compacted) == 12
+    assert compacted[0] == values[0]
+    assert compacted[-1] == values[-1]
+
+
 HOUR = 3600
 DAY = 24 * HOUR
 
 
 def account(account_id, *, weekly, weekly_reset, five=1.0, five_reset=None,
-            families=0, priority=0, now=None):
+            families=0, priority=0, weight=1, now=None):
     now = now or time.time()
     return OptimizationAccount(
         account_id=account_id,
@@ -45,6 +61,7 @@ def account(account_id, *, weekly, weekly_reset, five=1.0, five_reset=None,
         priority=priority,
         five_floor=0.0,
         active_families=families,
+        routing_weight=weight,
     )
 
 
@@ -91,6 +108,33 @@ def test_load_still_decides_between_equally_urgent_accounts():
     ], now=now)
     assert result is not None
     assert result.account_id == "idle"
+
+
+def test_manual_weight_favors_more_new_work_until_weighted_load_catches_up():
+    now = time.time()
+    shared = dict(weekly=0.8, weekly_reset=now + 3 * DAY,
+                  five_reset=now + 5 * HOUR, now=now)
+    favored = solve([
+        account("high", weight=4, **shared),
+        account("low", weight=1, **shared),
+    ], now=now, burn=0.001)
+    assert favored is not None and favored.account_id == "high"
+    balanced = solve([
+        account("high", weight=4, families=8, **shared),
+        account("low", weight=1, **shared),
+    ], now=now, burn=0.001)
+    assert balanced is not None and balanced.account_id == "low"
+
+
+def test_expiring_quota_overrides_manual_weight():
+    now = time.time()
+    result = solve([
+        account("expiring", weekly=0.8, weekly_reset=now + HOUR,
+                five_reset=now + HOUR, weight=1, now=now),
+        account("heavy", weekly=0.8, weekly_reset=now + 3 * DAY,
+                five_reset=now + 5 * HOUR, weight=10, now=now),
+    ], now=now)
+    assert result is not None and result.account_id == "expiring"
 
 
 def test_the_weight_cannot_outvote_half_an_hour_of_urgency():

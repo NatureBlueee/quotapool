@@ -38,6 +38,7 @@ from .launcher import (
 from .observe import observe
 from .proxy import serve
 from .reconcile import reconcile_report
+from .platform_paths import default_db_path, runtime_path as platform_runtime_path
 from .settings import (
     install_settings,
     proposed_settings,
@@ -53,16 +54,15 @@ from .shell import (
 def default_db() -> str:
     if os.environ.get("FLEET_DB"):
         return os.environ["FLEET_DB"]
-    runtime_path = Path(os.environ.get(
-        "FLEET_RUNTIME_CONFIG",
-        str(Path.home() / ".config" / "claude-fleet" / "runtime.json"),
-    )).expanduser()
+    runtime_path = platform_runtime_path()
     try:
         runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
         if runtime.get("db_path"):
             return str(runtime["db_path"])
     except (OSError, json.JSONDecodeError):
         pass
+    if os.name == "nt":
+        return str(default_db_path())
     return str(Path.cwd() / "work" / "claude-fleet.sqlite3")
 
 
@@ -543,11 +543,17 @@ def infer_launch_context(
     return workload_class, parent
 
 
-def run_teamclaude_cli(arguments: Sequence[str]) -> None:
+def run_teamclaude_cli(
+    arguments: Sequence[str],
+    *,
+    environment_defaults: Optional[Dict[str, str]] = None,
+) -> None:
     from .launcher import load_runtime
 
     runtime = load_runtime()
     env = os.environ.copy()
+    for key, value in (environment_defaults or {}).items():
+        env.setdefault(key, value)
     env["TEAMCLAUDE_CONFIG"] = str(runtime["teamclaude_config"])
     env["TEAMCLAUDE_DISABLE_AUTOUPDATE"] = "1"
     outbound_proxy = str(runtime.get("outbound_proxy") or "").strip()
@@ -572,15 +578,26 @@ def run_teamclaude_cli(arguments: Sequence[str]) -> None:
             node_arguments.append("--use-env-proxy")
     except (OSError, subprocess.SubprocessError):
         pass
-    os.execvpe(
-        node,
-        node_arguments + [entry] + list(arguments),
-        env,
-    )
+    command = node_arguments + [entry] + list(arguments)
+    if os.name == "nt":
+        raise SystemExit(subprocess.call(command, env=env))
+    os.execvpe(node, command, env)
 
 
 def run_login(name: str) -> None:
-    run_teamclaude_cli(["login", "--oauth", "--name", name])
+    # Two minutes is often shorter than a Windows browser account switch plus
+    # consent flow. When the callback listener exits first, the successful
+    # OAuth redirect lands on a closed localhost port and Edge reports
+    # ERR_CONNECTION_REFUSED. Match the dashboard's ten-minute window while
+    # still allowing an explicit operator override.
+    defaults = (
+        {"TEAMCLAUDE_LOGIN_TIMEOUT_MS": "600000"}
+        if os.name == "nt" else None
+    )
+    run_teamclaude_cli(
+        ["login", "--oauth", "--name", name],
+        environment_defaults=defaults,
+    )
 
 
 def run_import_setup_token(name: str, source: str) -> None:

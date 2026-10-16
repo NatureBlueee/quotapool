@@ -25,6 +25,14 @@ quotapool = "claude_fleet.cli:main"
 # The old name, kept because a running install has it wired into launchd
 # plists, wrapper scripts and a shell shim.
 fleet = "claude_fleet.cli:main"
+quotapool-desktop = "claude_fleet.desktop:main"
+quotapool-desktop-wrapper = "claude_fleet.desktop:wrapper_main"
+quotapool-desktop-code = "claude_fleet.desktop:desktop_code_main"
+quotapool-tray = "claude_fleet.tray:main"
+quotapool-wsl-guard = "claude_fleet.wsl_guard:main"
+
+[tool.setuptools.package-data]
+claude_fleet = ["dashboard.html", "sidebar-mascot.png", "workspace.css", "workspace.js"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -66,6 +66,57 @@ claude
 > 部署到底是怎么装的**——两台机器各跑哪些服务和定时器、彼此怎么连、那条链路
 > 真出过什么故障。它是写来给你映射到自己环境的，不是让你照抄的。
 
+### Windows Claude Code Desktop
+
+仓库也提供了 Windows 适配层，保留 Claude Desktop 的官方 UI，只接管它
+启动的 Code 会话。它不会修改 Microsoft Store 安装包或 `app.asar`。
+
+```powershell
+.\install-windows.ps1       # 默认只预览，不写任何东西
+.\install-windows.ps1 -Install
+```
+
+详细边界和卸载方式见 [`docs/WINDOWS-DESKTOP.md`](docs/WINDOWS-DESKTOP.md)。
+在真正安装前，先确认当前任务已经结束；安装会给 `%USERPROFILE%\.claude\settings.json`
+加入 `processWrapper` 和 hooks。
+
+安装后，Windows 通知区域会常驻一个原生状态图标：前台数字是当前可用账号数，
+绿色表示正常，黄色表示任务等待或 WSL 链路需检查，红色 `0`/`!` 表示没有可用
+账号或本地服务不可达。左键打开完整面板，右键可刷新、修复服务、查看日志或在
+确认后重启服务。监控器随用户登录启动，退出监控器不会停止正在运行的后台服务。
+Windows 安装还会每 10 分钟静默检查宿主磁盘；空间不足时按“过期临时文件 →
+WSL 包缓存/日志/TRIM → 已明确配置且未被使用的 Rust `target` 缓存”分级维护。
+只要仍有 Claude SSH 会话、Rust 编译进程或目标目录正被进程使用，最后一级就会
+跳过。面板会显示最近检测时间和回收量，源码、模型、Docker 与会话记录不在自动
+清理范围内。
+
+### 连接自愈与拥塞保护
+
+数据面会把 Claude 的模型请求与普通 TCP/WebSocket 连接分开管理。正常完成、
+客户端主动断开或上游流中断都会立即释放请求占位；同时每 15 秒执行一次保守
+巡检，只回收已经能由响应对象确认关闭的连接，**不会用固定时长强杀仍在输出的
+Claude 会话**。资源管理页会显示活动请求、等待额度、正常释放、客户端关闭、
+兜底回收、最老请求和最近巡检时间，用来区分“仍在工作”“等待额度”和“连接
+已经失效”。
+
+默认上限可以在 TeamClaude 配置的 `connectionManagement` 中调整，也可以用
+环境变量覆盖：
+
+```json
+{
+  "connectionManagement": {
+    "maxConnections": 512,
+    "maxActiveRequests": 256,
+    "maxPerSession": 64
+  }
+}
+```
+
+对应环境变量是 `TEAMCLAUDE_MAX_CONNECTIONS`、
+`TEAMCLAUDE_MAX_ACTIVE_REQUESTS` 和 `TEAMCLAUDE_MAX_REQUESTS_PER_SESSION`。
+达到请求上限时，新请求会收到带短暂 `Retry-After` 的保护性 503，让客户端重试，
+而不是继续堆积并拖垮正在运行的任务。
+
 ### 万一坏了
 
 `claude` 是走 Quotapool 的，所以一个装坏的 Quotapool 本来会把 `claude` 一起

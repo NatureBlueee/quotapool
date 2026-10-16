@@ -1,0 +1,24 @@
+#!/bin/sh
+# Version-local entry point for Claude Desktop's WSL-managed Claude Code binary.
+# The original ELF binary is kept beside this file with a .quotapool-real suffix.
+set -eu
+
+entry=$0
+case "$entry" in
+    /*) ;;
+    *) entry=$(command -v -- "$entry") ;;
+esac
+
+real="${entry}.quotapool-real"
+wrapper=${QUOTAPOOL_WRAPPER:-"$HOME/.local/bin/claude-fleet-wrapper"}
+
+if [ ! -x "$real" ]; then
+    printf '%s\n' "quotapool: Claude Desktop binary is missing: $real" >&2
+    exit 78
+fi
+if [ ! -x "$wrapper" ]; then
+    printf '%s\n' "quotapool: wrapper is unavailable: $wrapper" >&2
+    exit 78
+fi
+
+exec "$wrapper" "$real" "$@"

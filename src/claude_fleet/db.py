@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import json
 import os
 import sqlite3
@@ -10,11 +9,20 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
 
 # Bump whenever SCHEMA changes. ``initialize`` compares this against the
 # database's ``PRAGMA user_version`` and only takes a write lock when they
 # differ, so hook subprocesses stop competing with the coordinator for DDL.
 SCHEMA_VERSION = 3
+
+
+class WriteBudgetExceeded(TimeoutError):
+    """A request exhausted its bounded database writer budget."""
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -234,6 +242,7 @@ class FleetDB:
         # SQLite busy handlers that each sleep for ten seconds and then fail.
         # RLock keeps future transaction helpers composable within one process.
         self._write_lock = threading.RLock()
+        self._write_budget = threading.local()
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self.initialize()
 
@@ -242,7 +251,34 @@ class FleetDB:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=10000")
+        deadline = getattr(self._write_budget, "deadline", None)
+        if deadline is not None:
+            remaining = max(1, int((deadline - time.monotonic()) * 1000))
+            conn.execute(f"PRAGMA busy_timeout={min(10000, remaining)}")
         return conn
+
+    @contextlib.contextmanager
+    def write_budget(self, seconds: float) -> Iterator[None]:
+        previous = getattr(self._write_budget, "deadline", None)
+        deadline = time.monotonic() + seconds
+        self._write_budget.deadline = min(previous, deadline) if previous else deadline
+        try:
+            yield
+        finally:
+            self._write_budget.deadline = previous
+
+    @contextlib.contextmanager
+    def budget_lock(self, lock) -> Iterator[None]:
+        deadline = getattr(self._write_budget, "deadline", None)
+        acquired = lock.acquire() if deadline is None else lock.acquire(
+            timeout=max(0, deadline - time.monotonic())
+        )
+        if not acquired:
+            raise WriteBudgetExceeded("database writer queue exceeded request budget")
+        try:
+            yield
+        finally:
+            lock.release()
 
     # Columns added after a table's original CREATE. `CREATE TABLE IF NOT
     # EXISTS` will not add them to an existing table, so each needs an explicit
@@ -372,18 +408,61 @@ class FleetDB:
         # busy-handler convoys and route decisions time out after 10-15 seconds.
         # An advisory file lock gives every Fleet process one shared writer
         # queue before BEGIN IMMEDIATE — and before schema DDL.
-        with self._write_lock:
+        with self.budget_lock(self._write_lock):
             lock_fd = os.open(
                 self._writer_lock_path,
                 os.O_CREAT | os.O_RDWR,
                 0o600,
             )
+            locked = False
             try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                deadline = getattr(self._write_budget, "deadline", None)
+                self._lock_file(lock_fd, deadline=deadline)
+                locked = True
                 yield
             finally:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                if locked:
+                    self._unlock_file(lock_fd)
                 os.close(lock_fd)
+
+    @staticmethod
+    def _lock_file(lock_fd: int, *, deadline: Optional[float] = None) -> None:
+        """Take the process-wide writer lock on Unix or Windows.
+
+        ``fcntl.flock`` is not available on Windows. ``msvcrt.locking`` locks a
+        byte range instead, so the lock file is kept at one byte and every
+        process competes for byte zero.  LK_NBLCK plus a short retry loop gives
+        it the same wait-until-available behaviour as blocking ``flock``;
+        LK_LOCK itself gives up after ten seconds, which is too short for a
+        coordinator intentionally holding a long SQLite transaction.
+        """
+        if os.name != "nt":
+            if deadline is None:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                return
+        if os.fstat(lock_fd).st_size == 0:
+            os.write(lock_fd, b"\0")
+            os.fsync(lock_fd)
+        while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise WriteBudgetExceeded("database file lock exceeded request budget")
+            os.lseek(lock_fd, 0, os.SEEK_SET)
+            try:
+                if os.name == "nt":
+                    msvcrt.locking(lock_fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except OSError:
+                time.sleep(0.05)
+
+    @staticmethod
+    def _unlock_file(lock_fd: int) -> None:
+        if os.name != "nt":
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            return
+        os.lseek(lock_fd, 0, os.SEEK_SET)
+        msvcrt.locking(lock_fd, msvcrt.LK_UNLCK, 1)
 
     @contextlib.contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

@@ -1,0 +1,21 @@
+#!/bin/sh
+# Dedicated SSH entry point for Claude Desktop.  Desktop's remote service
+# starts its bundled Claude binary by absolute path, so a PATH shim alone
+# cannot route that first process through QuotaPool.  Restrict a dedicated SSH
+# public key to this command; the whole remote service then inherits the same
+# fail-closed proxy environment as an ordinary `fleet run` launch.
+set -eu
+
+wrapper=${QUOTAPOOL_WRAPPER:-"$HOME/.local/bin/claude-fleet-wrapper"}
+
+if [ ! -x "$wrapper" ]; then
+    echo "claude-fleet-ssh-entry: wrapper is unavailable: $wrapper" >&2
+    exit 78
+fi
+
+if [ -z "${SSH_ORIGINAL_COMMAND:-}" ]; then
+    echo "claude-fleet-ssh-entry: interactive shells are disabled for this key" >&2
+    exit 78
+fi
+
+exec "$wrapper" /bin/sh -c "$SSH_ORIGINAL_COMMAND"

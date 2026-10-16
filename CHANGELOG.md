@@ -8,6 +8,19 @@ The repository's own history begins on 2026-07-30 and is not published — it is
 142 commits of one fleet's operational life, including addresses and hostnames.
 This file is the public record of what changed and why.
 
+## [Unreleased]
+
+### Claude Desktop recovery
+
+- A successful-looking Anthropic stream that ends after hidden thinking, but
+  contains no text or new tool call, is no longer passed to Claude Desktop as a
+  completed turn when it immediately follows a `tool_result`. The data plane
+  retries that inference invisibly up to two times before falling back to the
+  Desktop's own recovery path. Already-completed tools are never replayed.
+- Empty-turn detections and retries are exposed in `/teamclaude/status` under
+  `requestHealth`. Set `TEAMCLAUDE_EMPTY_TURN_RETRIES` to `0`-`3` to override
+  the default retry limit of `2`.
+
 ## [0.4.8] — 2026-08-12
 
 First public release. Everything below already ran in production on a two-host

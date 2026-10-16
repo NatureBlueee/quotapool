@@ -28,12 +28,78 @@ import os
 import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 INSTALLER = REPO / "install.sh"
+
+
+def test_bootstrap_preserves_an_existing_cross_host_ca(tmp_path):
+    config = tmp_path / "config"
+    state = tmp_path / "state"
+    config.mkdir()
+    cross_host_ca = tmp_path / "wsl-teamclaude-ca.pem"
+    cross_host_ca.write_text("test-ca\n", encoding="utf-8")
+    (config / "runtime.json").write_text(
+        json.dumps({"ca_path": str(cross_host_ca)}), encoding="utf-8"
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(REPO / "scripts" / "bootstrap_config.py"),
+            "--config-dir", str(config),
+            "--state-dir", str(state),
+            "--prefix", str(REPO),
+            "--claude-binary", str(tmp_path / "claude"),
+            "--token=test-token",
+            "--node-binary", str(tmp_path / "node"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    runtime = json.loads((config / "runtime.json").read_text(encoding="utf-8"))
+    assert runtime["ca_path"] == str(cross_host_ca)
+
+
+def test_bootstrap_accepts_explicit_windows_ports_and_ca(tmp_path):
+    config = tmp_path / "config"
+    state = tmp_path / "state"
+    local_ca = config / "teamclaude-ca.pem"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(REPO / "scripts" / "bootstrap_config.py"),
+            "--config-dir", str(config),
+            "--state-dir", str(state),
+            "--prefix", str(REPO),
+            "--claude-binary", str(tmp_path / "claude"),
+            "--token=test-token",
+            "--node-binary", str(tmp_path / "node"),
+            "--proxy-port=13457",
+            "--coordinator-port=17893",
+            "--ca-path", str(local_ca),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    runtime = json.loads((config / "runtime.json").read_text(encoding="utf-8"))
+    team = json.loads((config / "teamclaude.json").read_text(encoding="utf-8"))
+    assert runtime["proxy_port"] == 13457
+    assert runtime["coordinator_port"] == 17893
+    assert runtime["ca_path"] == str(local_ca)
+    assert team["proxy"]["port"] == 13457
+    assert team["fleetCoordinator"]["url"] == "http://127.0.0.1:17893"
 
 
 @pytest.fixture()
