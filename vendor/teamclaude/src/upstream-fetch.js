@@ -26,9 +26,26 @@ import { tunnelTls } from './sx.js';
 // per-origin and bounds the fan-out. Escape hatch:
 // TEAMCLAUDE_UPSTREAM_GLOBAL_FETCH=1 reverts to the old global-fetch path.
 const configuredMaxSockets = Number(process.env.TEAMCLAUDE_UPSTREAM_MAX_SOCKETS);
-const MAX_SOCKETS = configuredMaxSockets > 0 ? configuredMaxSockets : Infinity;
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: MAX_SOCKETS });
-const httpAgent = new http.Agent({ keepAlive: true, maxSockets: MAX_SOCKETS });
+// An unbounded default can exhaust Windows' ephemeral ports when several
+// Desktop/Code sessions upload context at once. 32 still permits substantial
+// parallelism, while making excess work queue inside Node instead of creating a
+// burst of hundreds of loopback proxy sockets (ENOBUFS).
+const MAX_SOCKETS = configuredMaxSockets > 0 ? Math.floor(configuredMaxSockets) : 32;
+const configuredMaxFreeSockets = Number(process.env.TEAMCLAUDE_UPSTREAM_MAX_FREE_SOCKETS);
+const MAX_FREE_SOCKETS = configuredMaxFreeSockets >= 0
+  ? Math.floor(configuredMaxFreeSockets)
+  : 8;
+const httpsAgent = new https.Agent({
+  keepAlive: true,
+  maxSockets: MAX_SOCKETS,
+  maxFreeSockets: MAX_FREE_SOCKETS,
+});
+const httpAgent = new http.Agent({
+  keepAlive: true,
+  maxSockets: MAX_SOCKETS,
+  maxFreeSockets: MAX_FREE_SOCKETS,
+});
+const environmentTunnelAgents = new Map();
 const USE_GLOBAL_FETCH = /^(1|true|yes|on)$/i.test(process.env.TEAMCLAUDE_UPSTREAM_GLOBAL_FETCH || '');
 const ENV_PROXY_TUNNEL_TIMEOUT_MS = Math.max(
   0,
@@ -98,9 +115,50 @@ export function upstreamFetch(url, opts = {}, sx = null, useProxy = false) {
       timeoutMs,
       {},
       Math.min(timeoutMs, ENV_PROXY_TUNNEL_TIMEOUT_MS),
+      environmentTunnelAgent(url, environmentProxy),
     );
   }
   return USE_GLOBAL_FETCH ? directFetch(url, fetchOpts, timeoutMs) : pooledFetch(url, fetchOpts, timeoutMs);
+}
+
+// Environment proxy routing is stable for the life of the process, so reuse a
+// bounded keep-alive agent per proxy/target pair. The old per-request agent
+// opened a fresh CONNECT socket for every turn; under concurrent sessions that
+// accumulated hundreds of loopback TIME_WAIT sockets and eventually failed
+// with `connect ENOBUFS 127.0.0.1:<proxy>`. sx.org stays one-shot below because
+// its endpoint and TLS options can change between attempts.
+export function environmentTunnelAgent(url, proxy) {
+  const target = new URL(url);
+  const targetPort = Number(target.port) || 443;
+  const key = JSON.stringify([
+    proxy.host,
+    proxy.port,
+    proxy.username || '',
+    proxy.password || '',
+    target.hostname,
+    targetPort,
+  ]);
+  let agent = environmentTunnelAgents.get(key);
+  if (agent) return agent;
+
+  agent = new https.Agent({
+    keepAlive: true,
+    maxSockets: MAX_SOCKETS,
+    maxFreeSockets: MAX_FREE_SOCKETS,
+  });
+  agent.createConnection = (_options, cb) => {
+    tunnelTls({
+      proxy,
+      targetHost: target.hostname,
+      targetPort,
+      timeout: ENV_PROXY_TUNNEL_TIMEOUT_MS,
+    })
+      .then((sock) => cb(null, sock))
+      .catch((err) => cb(err));
+    return undefined;
+  };
+  environmentTunnelAgents.set(key, agent);
+  return agent;
 }
 
 function bypassesProxy(hostname, port) {
@@ -194,21 +252,24 @@ function tunneledFetch(
   timeoutMs,
   tlsOptions = {},
   tunnelTimeoutMs = 30_000,
+  suppliedAgent = null,
 ) {
   const u = new URL(url);
-  const agent = new https.Agent({ keepAlive: false });
-  agent.createConnection = (_options, cb) => {
-    tunnelTls({
-      proxy,
-      targetHost: u.hostname,
-      targetPort: Number(u.port) || 443,
-      tlsOptions,
-      timeout: tunnelTimeoutMs,
-    })
-      .then((sock) => cb(null, sock))
-      .catch((err) => cb(err));
-    return undefined; // socket delivered asynchronously via cb
-  };
+  const agent = suppliedAgent || new https.Agent({ keepAlive: false });
+  if (!suppliedAgent) {
+    agent.createConnection = (_options, cb) => {
+      tunnelTls({
+        proxy,
+        targetHost: u.hostname,
+        targetPort: Number(u.port) || 443,
+        tlsOptions,
+        timeout: tunnelTimeoutMs,
+      })
+        .then((sock) => cb(null, sock))
+        .catch((err) => cb(err));
+      return undefined; // socket delivered asynchronously via cb
+    };
+  }
   return nodeRequest(u, opts, timeoutMs, { transport: https, agent });
 }
 
@@ -249,12 +310,17 @@ function nodeRequest(u, opts, timeoutMs, { transport, agent }) {
 // fires after 'end'), which crashes the process. The `closed` guard makes close
 // idempotent; backpressure via pause/resume so a slow consumer doesn't buffer the
 // whole (possibly minutes-long) stream in memory.
-function nodeToWeb(res) {
+export function nodeToWeb(res) {
   let closed = false;
   const close = (controller) => {
     if (closed) return;
     closed = true;
     try { controller.close(); } catch { /* already closed / consumer gone */ }
+  };
+  const fail = (controller, err) => {
+    if (closed) return;
+    closed = true;
+    try { controller.error(err); } catch { /* consumer gone */ }
   };
   return new ReadableStream({
     start(controller) {
@@ -263,12 +329,28 @@ function nodeToWeb(res) {
         if (controller.desiredSize != null && controller.desiredSize <= 0) res.pause();
       });
       res.on('end', () => close(controller));
-      res.on('close', () => close(controller));
-      res.on('error', (err) => {
+      // IncomingMessage can close without an `error` event when the underlying
+      // socket disappears mid-body. Treating every close as normal EOF loses the
+      // terminal SSE frame and leaves Desktop displaying a half-answer forever.
+      // A complete response has already emitted `end` (or has complete=true);
+      // anything else is a truncated transport response and must reject so the
+      // outer proxy destroys the downstream stream and the client reconnects.
+      res.on('close', () => {
         if (closed) return;
-        closed = true;
-        try { controller.error(err); } catch { /* consumer gone */ }
+        if (res.complete || res.readableEnded) {
+          close(controller);
+          return;
+        }
+        const err = new Error('upstream response closed before the body completed');
+        err.code = 'ECONNRESET';
+        fail(controller, err);
       });
+      res.on('aborted', () => {
+        const err = new Error('upstream response aborted before the body completed');
+        err.code = 'ECONNRESET';
+        fail(controller, err);
+      });
+      res.on('error', (err) => fail(controller, err));
     },
     pull() { res.resume(); },
     cancel() { res.destroy(); },

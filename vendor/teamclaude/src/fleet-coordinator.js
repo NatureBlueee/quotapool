@@ -37,10 +37,121 @@ export class FleetCoordinator {
     // synchronized retry storm after the code has been upgraded.
     this.timeoutMs = Math.max(15_000, Number(config.timeoutMs || 15_000));
     this.leaseHeartbeatMs = Number(config.leaseHeartbeatMs || 30_000);
+    // A route already approved for this exact session/model is safe to reuse
+    // briefly when the local coordinator misses its deadline.  Without this,
+    // a single 15s SQLite/CPU hitch is returned as `null`, which server.js
+    // interprets as real quota exhaustion and parks a healthy request for up to
+    // six hours.  The cache is deliberately short lived, session scoped, and
+    // rechecks the data plane's live availability/exclusion state before use.
+    // It cannot create a new route or bypass a pin decision.
+    this.routeFallbackMs = Math.max(
+      0,
+      Number(config.routeFallbackMs ?? 90_000),
+    );
+    this.recentRoutes = new Map();
     // A Team/subagent fan-out can issue many simultaneous model requests for
     // one Claude session. They need one route lookup, not N identical HTTP
     // calls and N competing SQLite transactions.
     this.pendingSelections = new Map();
+  }
+
+  _routeKey(args) {
+    return JSON.stringify([
+      sessionIdFor(args.ctx, args.req),
+      args.ctx.model || '',
+      args.ctx.advisorModel || '',
+    ]);
+  }
+
+  _rememberRoute(args, account) {
+    if (!account || this.routeFallbackMs <= 0) return;
+    this.recentRoutes.set(this._routeKey(args), {
+      accountId: accountId(account),
+      approvedAt: Date.now(),
+      lease: args.ctx.fleetLease ? { ...args.ctx.fleetLease } : null,
+    });
+    // Bound a long-running Desktop process even when it sees thousands of
+    // one-off subagent sessions.  Oldest insertion order is sufficient here.
+    while (this.recentRoutes.size > 2048) {
+      this.recentRoutes.delete(this.recentRoutes.keys().next().value);
+    }
+  }
+
+  _excludedAccountIds(accountManager, ctx) {
+    return new Set([
+      ...[...(ctx.tried || [])]
+        .map(index => accountManager.accounts[index])
+        .filter(Boolean)
+        .map(accountId),
+      ...(ctx.unresolvable || []),
+    ]);
+  }
+
+  /**
+   * Resolve the quota constraint for this routing decision.
+   *
+   * Claude Code includes its advisor model in the outer executor request. The
+   * advisor may run later on the same account, so preferring an account that can
+   * serve both is useful. It is not, however, a reason to stop the executor: if
+   * no remaining account has advisor quota, the ordinary (non-Fleet) selector
+   * deliberately falls back to the request model alone. Fleet must preserve
+   * that behaviour or an exhausted Fable advisor bucket parks an Opus request.
+   *
+   * Exclusions participate in the strict-candidate check. Otherwise an account
+   * that already failed this request could keep the advisor constraint active
+   * and make every usable executor-only account look ineligible.
+   */
+  _selectionPolicy(accountManager, ctx) {
+    const excluded = this._excludedAccountIds(accountManager, ctx);
+    const routable = account => account?.type === 'oauth'
+      && !account.upstream
+      && !excluded.has(accountId(account));
+
+    let advisorModel = null;
+    if (ctx.advisorModel) {
+      const strictAvailable = accountManager.accounts.some(account =>
+        routable(account)
+        && accountManager.isAccountAvailable(
+          account,
+          ctx.model,
+          ctx.advisorModel,
+        ));
+      if (strictAvailable) {
+        advisorModel = ctx.advisorModel;
+      } else if (Date.now() >= (this._advisorDegradeLogAt || 0)) {
+        this._advisorDegradeLogAt = Date.now() + 60_000;
+        console.log(
+          `[ClaudeFleet] No remaining account can serve advisor model `
+          + `"${ctx.advisorModel}"; routing the "${ctx.model}" request by its `
+          + 'own quota only',
+        );
+      }
+    }
+
+    return {
+      advisorModel,
+      isEligible: account => routable(account)
+        && accountManager.isAccountAvailable(account, ctx.model, advisorModel),
+    };
+  }
+
+  _recentApprovedRoute(args) {
+    if (this.routeFallbackMs <= 0) return null;
+    const key = this._routeKey(args);
+    const cached = this.recentRoutes.get(key);
+    if (!cached) return null;
+    if (Date.now() - cached.approvedAt > this.routeFallbackMs) {
+      this.recentRoutes.delete(key);
+      return null;
+    }
+    const { accountManager, ctx } = args;
+    const account = accountManager.accounts.find(
+      item => accountId(item) === cached.accountId,
+    );
+    const policy = this._selectionPolicy(accountManager, ctx);
+    if (!account || !policy.isEligible(account)) return null;
+    if (cached.lease) this._startHeartbeat(ctx, cached.lease);
+    return account;
   }
 
   async _post(path, body) {
@@ -204,9 +315,20 @@ export class FleetCoordinator {
    */
   async _selectOrWait(args) {
     try {
-      return await this._select(args);
+      const account = await this._select(args);
+      this._rememberRoute(args, account);
+      return account;
     } catch (error) {
       if (!error?.fleetCoordinatorUnreachable) throw error;
+      const cached = this._recentApprovedRoute(args);
+      if (cached) {
+        console.error(
+          '[ClaudeFleet] %s coordinator missed its deadline; reusing the recent '
+          + 'approved route for session=%s account=%s (bounded fallback)',
+          new Date().toISOString(), args?.ctx?.sessionId || '?', cached.name,
+        );
+        return cached;
+      }
       console.error(
         '[ClaudeFleet] %s coordinator unreachable — retrying once, then holding. '
         + 'This is NOT a capacity shortage. cause=%s session=%s',
@@ -214,7 +336,9 @@ export class FleetCoordinator {
       );
       await new Promise(resolve => setTimeout(resolve, 2000));
       try {
-        return await this._select(args);
+        const account = await this._select(args);
+        this._rememberRoute(args, account);
+        return account;
       } catch (again) {
         if (!again?.fleetCoordinatorUnreachable) throw again;
         // The cause is the whole diagnosis. "Unreachable" covers a refused
@@ -235,6 +359,7 @@ export class FleetCoordinator {
   }
 
   async _select({ accountManager, ctx, req }) {
+    const selectionPolicy = this._selectionPolicy(accountManager, ctx);
     const accounts = accountManager.accounts.map(account => ({
       id: accountId(account),
       name: account.name,
@@ -246,9 +371,7 @@ export class FleetCoordinator {
       status: account.status,
       // Usage-based API keys and third-party upstreams are deliberately outside
       // Fleet. No automatic route may create subscription-external spend.
-      eligible: account.type === 'oauth'
-        && !account.upstream
-        && accountManager.isAccountAvailable(account, ctx.model, ctx.advisorModel),
+      eligible: selectionPolicy.isEligible(account),
       quota: account.quota || {},
     }));
     const excludeIds = [
@@ -295,7 +418,9 @@ export class FleetCoordinator {
       workload_class: header(req, 'x-fleet-workload-class') || 'interactive',
       workload_id: header(req, 'x-fleet-workload-id'),
       model: ctx.model,
-      advisor_model: ctx.advisorModel,
+      // This is the constraint actually applied to `accounts[].eligible`.
+      // The outer request model remains authoritative for quota accounting.
+      advisor_model: selectionPolicy.advisorModel,
       exclude_account_ids: excludeIds,
       accounts,
     };
@@ -315,16 +440,20 @@ export class FleetCoordinator {
         if (item.disabled) reasons.push('disabled');
         if (item.status === 'error') reasons.push('auth-error');
         if (!item.eligible && !item.disabled && item.status !== 'error') {
-          const weekly = item.quota?.unified7d;
           const fiveHour = item.quota?.unified5h;
           reasons.push(
-            `ineligible(7d=${weekly ?? '?'},5h=${fiveHour ?? '?'})`,
+            `ineligible(5h=${fiveHour ?? '?'},shared7d=${item.quota?.unified7d ?? '?'},`
+            + `fable7d=${item.quota?.unified7dFable ?? '?'},`
+            + `sonnet7d=${item.quota?.unified7dSonnet ?? '?'})`,
           );
         }
         return `${item.name}:${reasons.length ? reasons.join('+') : 'available'}`;
       });
       console.error(
-        `[ClaudeFleet] no_capacity for session ${sessionId} — ${verdict.join(' ')}`,
+        `[ClaudeFleet] no_capacity for session ${sessionId} `
+        + `(request=${ctx.model || '?'} requestedAdvisor=${ctx.advisorModel || '-'} `
+        + `effectiveAdvisor=${selectionPolicy.advisorModel || '-'}) — `
+        + verdict.join(' '),
       );
       return null;
     }
@@ -333,6 +462,15 @@ export class FleetCoordinator {
         `Fleet coordinator rejected route (${response.status}): `
         + `${result.message || result.error || 'unknown error'}`,
       );
+      if (response.status === 503 && result.error === 'coordinator_busy') {
+        // Local contention is not exhausted subscription capacity. Return an
+        // explicit transient overload instead of parking for a quota reset.
+        error.fleetStatus = 503;
+        error.fleetPublicError = {
+          type: 'overloaded_error',
+          message: 'Local routing is busy. Retry shortly; subscription quota is not reported exhausted.',
+        };
+      }
       if (response.status === 422 && /holder is required/i.test(
         String(result.message || result.error || ''),
       )) {
@@ -416,16 +554,17 @@ export class FleetCoordinator {
     if (
       selected.type !== 'oauth'
       || selected.upstream
-      || ctx.tried.has(selected.index)
-      || !accountManager.isAccountAvailable(selected, ctx.model, ctx.advisorModel)
+      || !selectionPolicy.isEligible(selected)
     ) {
       throw new Error(`Fleet coordinator selected ineligible account "${selected.name}"`);
     }
-    this._startHeartbeat(ctx, {
+    const lease = {
       sessionId,
       holder: result.writer_holder || body.holder,
       generation: result.writer_generation,
-    });
+    };
+    ctx.fleetLease = lease;
+    this._startHeartbeat(ctx, lease);
     return selected;
   }
 }

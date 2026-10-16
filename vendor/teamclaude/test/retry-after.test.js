@@ -95,6 +95,41 @@ test('the result is always at least one second', () => {
   assert.ok(seconds >= 1);
 });
 
+test('a non-exhausted bucket does not promise a false early recovery', () => {
+  const seconds = computeRetryAfter([
+    acct({
+      unified5h: 0.48,
+      unified5hReset: Date.now() + 10 * MIN,
+      unified7d: 0.99,
+      unified7dReset: Date.now() + 4 * HOUR,
+    }),
+  ]);
+  assert.ok(seconds > 3 * 3600, `healthy 5h reset leaked in: ${seconds}s`);
+});
+
+test('model-scoped recovery ignores unrelated family buckets', () => {
+  const seconds = computeRetryAfter([
+    acct({
+      unified5h: 0.2,
+      unified7d: 0.99,
+      unified7dReset: Date.now() + 4 * HOUR,
+      unified7dFable: 1,
+      unified7dFableReset: Date.now() + 10 * MIN,
+    }),
+  ], { weeklyBucket: 'unified7d' });
+  assert.ok(seconds > 3 * 3600, `Fable reset leaked into Opus: ${seconds}s`);
+});
+
+test('an errored account does not promise recovery from stale quota metadata', () => {
+  const seconds = computeRetryAfter([
+    acct({
+      unified5h: 1,
+      unified5hReset: Date.now() + 10 * MIN,
+    }, { status: 'error' }),
+  ]);
+  assert.equal(seconds, 60);
+});
+
 test('garbage timestamps do not produce NaN', () => {
   const seconds = computeRetryAfter([
     acct({ unified7d: 1, unified7dReset: 'not a date' }),

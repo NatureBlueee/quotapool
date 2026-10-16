@@ -35,10 +35,15 @@ function withEnv(vars, body) {
   }
 }
 
-const NO_PROXY_ENV = {
-  HTTPS_PROXY: undefined, https_proxy: undefined,
-  HTTP_PROXY: undefined, http_proxy: undefined,
-};
+// Windows exposes process.env keys case-insensitively. Deleting `https_proxy`
+// after setting `HTTPS_PROXY` therefore deletes the same value, so do not put
+// both spellings in one mutation set on that platform.
+const NO_PROXY_ENV = process.platform === 'win32'
+  ? { HTTPS_PROXY: undefined, HTTP_PROXY: undefined }
+  : {
+      HTTPS_PROXY: undefined, https_proxy: undefined,
+      HTTP_PROXY: undefined, http_proxy: undefined,
+    };
 
 test('no proxy configured means direct, exactly as before', () => {
   withEnv(NO_PROXY_ENV, () => {

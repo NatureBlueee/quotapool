@@ -622,6 +622,13 @@ export class AccountManager {
     return route?.bucket || weeklyBucketForModel(model);
   }
 
+  // Read-only public surface for status/retry calculations.  Keeping route
+  // bucket overrides here prevents the HTTP layer from reimplementing model
+  // family policy and drifting from account selection.
+  weeklyBucketForModel(model) {
+    return this._weeklyBucketFor(model);
+  }
+
   /** Whether `account` may serve `model`. A matching route with an `accounts`
    * list is exclusive (only listed accounts, by name or index). With no matching
    * route — or a route that lists no accounts — it falls back to the per-account

@@ -239,6 +239,11 @@ export function createDefaultConfig() {
     upstream: 'https://api.anthropic.com',
     switchThreshold: 0.98,
     holdSeconds: 0,
+    connectionManagement: {
+      maxConnections: 512,
+      maxActiveRequests: 256,
+      maxPerSession: 64,
+    },
     distributeSessions: false,
     eventLogging: 'hide',
     blockedModels: [],

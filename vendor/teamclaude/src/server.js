@@ -10,8 +10,14 @@ import { sanitizeToolPairs } from './tool-pair-sanitize.js';
 import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { TopLevelFieldFinder, modelGlobMatches } from './model.js';
 import { BodyWriter } from './request-log.js';
-import { upstreamFetch } from './upstream-fetch.js';
+import { environmentProxyFor, upstreamFetch } from './upstream-fetch.js';
 import { tunnelTls } from './sx.js';
+import {
+  emptyTurnRetryLimit,
+  probeAssistantJSON,
+  probeAssistantSSE,
+  requestEndsWithToolResult,
+} from './empty-turn-guard.js';
 
 
 // How many consecutive holds with an EMPTY exclude set before re-stating the
@@ -33,6 +39,148 @@ const HOLD_ESCALATION_ITERATIONS = 5;
 // In memory on purpose — these are live connections, and a process restart
 // drops them anyway.
 const waiting = new Map();
+
+// Bound model-request fan-out independently from raw TCP connections. Claude
+// Desktop can legitimately keep many CONNECT/WebSocket channels alive, while
+// a retry storm can create hundreds of model requests that all park for quota
+// and starve the event loop. The registry is shared by the base listener and
+// every MITM listener, so opening more CONNECT tunnels cannot bypass the cap.
+const activeRequests = new Map();
+const activeRequestsPerSession = new Map();
+let requestSequence = 0;
+let rejectedRequests = 0;
+const connectionLifecycle = {
+  completed: 0,
+  clientClosed: 0,
+  autoReaped: 0,
+  lastSweepAt: null,
+  lastReapedAt: null,
+};
+
+const CONNECTION_SWEEP_INTERVAL_MS = 15_000;
+
+function positiveLimit(value, fallback) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function connectionLimits(config = {}) {
+  const settings = config.connectionManagement || {};
+  return {
+    maxConnections: positiveLimit(
+      process.env.TEAMCLAUDE_MAX_CONNECTIONS ?? settings.maxConnections, 512),
+    maxActiveRequests: positiveLimit(
+      process.env.TEAMCLAUDE_MAX_ACTIVE_REQUESTS ?? settings.maxActiveRequests, 256),
+    maxPerSession: positiveLimit(
+      process.env.TEAMCLAUDE_MAX_REQUESTS_PER_SESSION ?? settings.maxPerSession, 64),
+  };
+}
+
+function nextRequestId() {
+  requestSequence = (requestSequence + 1) % Number.MAX_SAFE_INTEGER;
+  return requestSequence || ++requestSequence;
+}
+
+function responseIsClosed(response) {
+  return Boolean(
+    response?.destroyed
+    || response?.writableEnded
+    || response?.writableFinished
+    || response?.socket?.destroyed
+  );
+}
+
+function admitRequest(reqId, sessionId, config, response = null) {
+  // A missed close callback must not turn a completed response into permanent
+  // pressure. This sweep only forgets entries whose response is already closed;
+  // it never terminates or times out a live Claude stream.
+  sweepClosedRequests();
+  const limits = connectionLimits(config);
+  const key = sessionId || '(anonymous)';
+  const perSession = activeRequestsPerSession.get(key) || 0;
+  if (activeRequests.size >= limits.maxActiveRequests
+      || perSession >= limits.maxPerSession) {
+    rejectedRequests += 1;
+    return { admitted: false, limits, active: activeRequests.size, perSession };
+  }
+  activeRequests.set(reqId, {
+    sessionId: key,
+    since: Date.now(),
+    response,
+  });
+  activeRequestsPerSession.set(key, perSession + 1);
+  return { admitted: true, limits };
+}
+
+function releaseRequest(reqId, reason = 'finally') {
+  const entry = activeRequests.get(reqId);
+  if (!entry) return;
+  activeRequests.delete(reqId);
+  const count = activeRequestsPerSession.get(entry.sessionId) || 0;
+  if (count <= 1) activeRequestsPerSession.delete(entry.sessionId);
+  else activeRequestsPerSession.set(entry.sessionId, count - 1);
+  if (reason === 'completed') connectionLifecycle.completed += 1;
+  else if (reason === 'client-closed') connectionLifecycle.clientClosed += 1;
+  else if (reason === 'auto-reaped') {
+    connectionLifecycle.autoReaped += 1;
+    connectionLifecycle.lastReapedAt = new Date().toISOString();
+  }
+}
+
+export function sweepClosedRequests(now = Date.now()) {
+  let reaped = 0;
+  connectionLifecycle.lastSweepAt = new Date(now).toISOString();
+  for (const [reqId, entry] of activeRequests) {
+    if (!responseIsClosed(entry.response)) continue;
+    releaseRequest(reqId, 'auto-reaped');
+    waiting.delete(reqId);
+    reaped += 1;
+  }
+  for (const [reqId, entry] of waiting) {
+    if (!responseIsClosed(entry.response)) continue;
+    waiting.delete(reqId);
+  }
+  return reaped;
+}
+
+export function requestPressureSnapshot(config = {}, now = Date.now()) {
+  sweepClosedRequests(now);
+  const limits = connectionLimits(config);
+  const entries = [...activeRequests.values()];
+  return {
+    active: entries.length,
+    sessions: activeRequestsPerSession.size,
+    rejected: rejectedRequests,
+    oldestSeconds: entries.length
+      ? Math.round(Math.max(...entries.map(entry => now - entry.since)) / 1000)
+      : 0,
+    limits,
+    overloaded: entries.length >= limits.maxActiveRequests,
+    lifecycle: { ...connectionLifecycle },
+  };
+}
+
+// A plain sleep leaves an orphan request alive until the next polling tick
+// after Claude Desktop closes the channel. Race the timer with response close
+// so held requests disappear immediately and their outer finally block runs.
+export function waitForResponseOrTimeout(res, ms) {
+  if (res.destroyed || res.writableEnded) return Promise.resolve(false);
+  return new Promise(resolve => {
+    let settled = false;
+    let timer;
+    const finish = (elapsed) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      res.off?.('close', closed);
+      resolve(elapsed);
+    };
+    const closed = () => finish(false);
+    res.once('close', closed);
+    timer = setTimeout(() => finish(true), Math.max(0, ms));
+    timer.unref?.();
+  });
+}
 
 // Event loop lag. The one number that says whether this process is turning.
 //
@@ -66,6 +214,7 @@ export function loopLagSnapshot() {
 }
 
 export function waitingSnapshot(now = Date.now()) {
+  sweepClosedRequests(now);
   const entries = [...waiting.values()];
   // `everExcluded` separates the two cases that must never be conflated:
   // a request that knocked out its own healthy capacity (avoidable, a fault)
@@ -209,8 +358,12 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
         const status = accountManager.getStatus();
         const extra = hooks.getStatusExtra?.() || {};
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(
-          { ...extra, ...status, waiting: waitingSnapshot() }, null, 2));
+        res.end(JSON.stringify({
+          ...extra,
+          ...status,
+          waiting: waitingSnapshot(),
+          requests: requestPressureSnapshot(config),
+        }, null, 2));
         return;
       }
 
@@ -262,6 +415,13 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
 
   const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config });
   const server = http.createServer(requestHandler);
+  server.maxConnections = connectionLimits(config).maxConnections;
+  const connectionSweep = setInterval(
+    () => sweepClosedRequests(),
+    CONNECTION_SWEEP_INTERVAL_MS,
+  );
+  connectionSweep.unref?.();
+  server.once('close', () => clearInterval(connectionSweep));
 
   // Forward-proxy support (always on, so multiple claude instances can use
   // either ANTHROPIC_BASE_URL or HTTPS_PROXY against the same server). A CONNECT
@@ -408,8 +568,8 @@ export function createProxyRequestListener({
   forcedPin = null,
   transportHolder = null,
 }) {
-  let counter = 0;
   return async (req, res) => {
+    let admittedReqId = null;
     try {
       // Claude Code's telemetry (`/api/event_logging/*`) is high-volume noise in
       // the activity log. `config.eventLogging` (read live so the TUI toggle takes
@@ -454,7 +614,7 @@ export function createProxyRequestListener({
         const token = decodeURIComponent(afterPrefix.slice(0, tokenEnd));
         pinnedIndex = resolveAccountPin(accountManager, token);
         if (pinnedIndex == null) {
-          const reqId = ++counter;
+          const reqId = nextRequestId();
           const sessionId = req.headers['x-claude-code-session-id'] || null;
           if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${token}")`, status: 404, model: null, sessionId, pinned: false });
           res.writeHead(404, { 'Content-Type': 'application/json' });
@@ -473,7 +633,7 @@ export function createProxyRequestListener({
       if (pinnedIndex == null && forcedPin != null) {
         pinnedIndex = resolveAccountPin(accountManager, forcedPin);
         if (pinnedIndex == null) {
-          const reqId = ++counter;
+          const reqId = nextRequestId();
           const sessionId = req.headers['x-claude-code-session-id'] || null;
           if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${forcedPin}")`, status: 404, model: null, sessionId, pinned: false });
           res.writeHead(404, { 'Content-Type': 'application/json' });
@@ -482,11 +642,41 @@ export function createProxyRequestListener({
         }
       }
 
-      const reqId = ++counter;
+      const reqId = nextRequestId();
       // Claude Code tags each session's requests with this header (present on
       // /v1/messages and count_tokens). Read from headers up front so it drives
       // session-aware routing (issue #109) and colors the TUI activity stream.
       const sessionId = req.headers['x-claude-code-session-id'] || null;
+      const admission = admitRequest(reqId, sessionId, config, res);
+      if (!admission.admitted) {
+        res.writeHead(503, {
+          'Content-Type': 'application/json',
+          'Retry-After': '2',
+          'X-QuotaPool-Overload': 'request-limit',
+        });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: {
+            type: 'overloaded_error',
+            message: 'QuotaPool is protecting active Claude sessions; retry shortly.',
+          },
+        }));
+        hooks.onRequestEnd?.(reqId, {
+          method: req.method, path: req.url, account: '(admission limit)',
+          status: 503, model: null, sessionId, pinned: pinnedIndex != null,
+        });
+        return;
+      }
+      admittedReqId = reqId;
+      // Both events are used: finish handles keep-alive responses immediately;
+      // close handles client aborts. releaseRequest is idempotent.
+      const releaseCompleted = () => releaseRequest(reqId, 'completed');
+      const releaseClosed = () => releaseRequest(
+        reqId,
+        res.writableFinished || res.writableEnded ? 'completed' : 'client-closed',
+      );
+      res.once('finish', releaseCompleted);
+      res.once('close', releaseClosed);
       if (!hideActivity) hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionId, pinned: pinnedIndex != null });
 
       // Buffer request body (needed to resend on a different account after a 429).
@@ -540,6 +730,14 @@ export function createProxyRequestListener({
         pinnedIndex,
         holdBudgetMs: holdMs,
         sessionId,
+        // A clean 200 containing only hidden thinking after a tool_result is
+        // not a completed assistant turn.  Remember the request shape once so
+        // bounded retries do not depend on later body rewrites.
+        guardEmptyAfterTool: requestEndsWithToolResult(
+          body,
+          req.url,
+          req.headers['content-type'],
+        ),
         // Local-only CONNECT closure metadata. It is never copied into request
         // headers, request logs, account pins, or the upstream hop.
         transportHolder,
@@ -547,6 +745,9 @@ export function createProxyRequestListener({
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
+      hooks.onRequestStateStart?.(reqId, {
+        method: req.method, path: req.url, sessionId, model,
+      });
       accountManager.beginSession(sessionId);
       try {
         await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx);
@@ -566,10 +767,23 @@ export function createProxyRequestListener({
         waiting.delete(reqId);
         ctx.stopFleetHeartbeat?.();
         accountManager.endSession(sessionId);
+        hooks.onRequestStateEnd?.(reqId, {
+          method: req.method,
+          path: req.url,
+          account: ctx.account,
+          status: ctx.status,
+          model: ctx.model,
+          sessionId,
+          interrupted: Boolean(ctx.interrupted),
+        });
         if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, sessionId, pinned: ctx.pinnedIndex != null });
       }
     } catch (err) {
       console.error('[TeamClaude] Unhandled error:', err);
+    } finally {
+      // Covers parse/hook errors that happen before a response event. Normal
+      // finish/close also calls this path; releaseRequest is idempotent.
+      if (admittedReqId != null) releaseRequest(admittedReqId, 'finally');
     }
   };
 }
@@ -577,16 +791,51 @@ export function createProxyRequestListener({
 // Per-request https.Agent tunneled through sx.org — one-shot (no keep-alive
 // reuse, matching upstream-fetch.js's proxiedFetch), so a fresh sx tunnel is
 // dialed for this connection only.
-function sxAgent(sx, targetHost) {
-  const proxy = sx.getProxy();
+function tunnelAgent(proxy, targetHost, tlsOptions = {}) {
   const agent = new https.Agent({ keepAlive: false });
   agent.createConnection = (_options, cb) => {
-    tunnelTls({ proxy, targetHost, targetPort: 443, tlsOptions: sx.tlsOptions || {} })
+    tunnelTls({ proxy, targetHost, targetPort: 443, tlsOptions })
       .then((sock) => cb(null, sock))
       .catch((err) => cb(err));
     return undefined;
   };
   return agent;
+}
+
+// Remote Control and attachment requests deliberately keep the CLIENT's own
+// credential, but they still need to follow the service's configured egress.
+// Model requests already honour HTTPS_PROXY through upstreamFetch(); this relay
+// used to look only at sx, so on Windows it silently bypassed the local outbound
+// proxy and intermittently lost the long-lived Desktop channel.
+export function clientCredentialProxyFor(url, sx) {
+  if (sx?.useByDefault() && sx.isProvisioned()) {
+    return { proxy: sx.getProxy(), tlsOptions: sx.tlsOptions || {}, source: 'sx' };
+  }
+  const proxy = environmentProxyFor(url);
+  return proxy ? { proxy, tlsOptions: {}, source: 'environment' } : null;
+}
+
+function clientCredentialAgent(target, sx) {
+  if (target.protocol !== 'https:') return undefined;
+  const route = clientCredentialProxyFor(target, sx);
+  return route ? tunnelAgent(route.proxy, target.hostname, route.tlsOptions) : undefined;
+}
+
+// A source stream error does not make Node's pipe() close its destination. If
+// the upstream long-poll aborts after response headers, leaving the downstream
+// open makes Claude Desktop wait forever for an event or EOF. Tear it down so
+// the client immediately observes a broken channel and reconnects.
+export function bindRelayResponseLifecycle(upstreamRes, res, log = console.error) {
+  let ended = false;
+  upstreamRes.once('end', () => { ended = true; });
+  const abort = (err) => {
+    if (ended || res.destroyed || res.writableEnded) return;
+    const detail = err?.message || 'upstream response aborted';
+    log(`[TeamClaude] Remote Control response interrupted: ${detail}`);
+    res.destroy();
+  };
+  upstreamRes.once('aborted', () => abort(new Error('upstream response aborted')));
+  upstreamRes.once('error', abort);
 }
 
 /**
@@ -606,8 +855,7 @@ function relayStream(req, res, upstream, sx) {
     headers[key] = value;
   }
 
-  const useProxy = !!(sx?.useByDefault() && sx.isProvisioned());
-  const agent = useProxy ? sxAgent(sx, target.hostname) : undefined;
+  const agent = clientCredentialAgent(target, sx);
   const transport = target.protocol === 'http:' ? http : https;
 
   const upstreamReq = transport.request(target, { method: req.method, headers, agent }, (upstreamRes) => {
@@ -617,6 +865,7 @@ function relayStream(req, res, upstream, sx) {
       responseHeaders[key] = value;
     }
     res.writeHead(upstreamRes.statusCode, responseHeaders);
+    bindRelayResponseLifecycle(upstreamRes, res);
     upstreamRes.pipe(res);
   });
 
@@ -625,7 +874,13 @@ function relayStream(req, res, upstream, sx) {
     if (!res.headersSent) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Upstream unreachable' } }));
+    } else if (!res.writableEnded) {
+      res.destroy();
     }
+  });
+  upstreamReq.on('socket', (sock) => {
+    sock.setKeepAlive?.(true, 15_000);
+    sock.setNoDelay?.(true);
   });
   // Client disconnected (e.g. Claude Code closed the channel): tear down the
   // upstream side too instead of leaking an open connection.
@@ -657,8 +912,7 @@ export function relayUpgrade(req, socket, head, upstream, sx) {
     headers[key] = value;
   }
 
-  const useProxy = !!(sx?.useByDefault() && sx.isProvisioned());
-  const agent = useProxy ? sxAgent(sx, target.hostname) : undefined;
+  const agent = clientCredentialAgent(target, sx);
   const transport = target.protocol === 'http:' ? http : https;
 
   const upstreamReq = transport.request(target, { method: req.method, headers, agent });
@@ -669,6 +923,10 @@ export function relayUpgrade(req, socket, head, upstream, sx) {
     socket.write(`HTTP/1.1 ${upstreamRes.statusCode} ${upstreamRes.statusMessage}\r\n${headerLines}\r\n\r\n`);
     if (upstreamHead?.length) socket.write(upstreamHead);
     if (head?.length) upstreamSocket.write(head);
+    socket.setKeepAlive?.(true, 15_000);
+    upstreamSocket.setKeepAlive?.(true, 15_000);
+    socket.setNoDelay?.(true);
+    upstreamSocket.setNoDelay?.(true);
     socket.pipe(upstreamSocket);
     upstreamSocket.pipe(socket);
     // An upgraded socket defaults to half-open: the peer's FIN only ends the
@@ -824,7 +1082,7 @@ export function classifyUpstreamError(err) {
     code === 'TEAMCLAUDE_ADMISSION_TIMEOUT' ||
     name === 'TimeoutError' || name === 'AbortError' ||
     message.includes('fetch failed') ||
-    code === 'ECONNRESET' || code === 'ECONNREFUSED' ||
+    code === 'ECONNRESET' || code === 'ECONNREFUSED' || code === 'ENOBUFS' ||
     code === 'ETIMEDOUT' || code === 'UND_ERR_CONNECT_TIMEOUT' ||
     code === 'UND_ERR_HEADERS_TIMEOUT' || code === 'UND_ERR_BODY_TIMEOUT'
   ) {
@@ -902,13 +1160,15 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // A pinned request concerns exactly one account: don't compute a fleet-wide
     // retry-after or sleep on other accounts' windows — return immediately.
     if (ctx.pinnedIndex != null) {
-      ctx.status = 429;
+      ctx.status = ctx.authRejected ? 401 : 429;
       ctx.account = '(pinned account unavailable)';
       if (!res.headersSent) {
-        res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': '5' });
+        res.writeHead(ctx.status, { 'Content-Type': 'application/json', ...(ctx.status === 429 ? { 'retry-after': '5' } : {}) });
         res.end(JSON.stringify({
           type: 'error',
-          error: { type: 'rate_limit_error', message: 'Pinned account is unavailable (rate-limited, errored, or already tried). Retry shortly.' },
+          error: ctx.authRejected
+            ? { type: 'authentication_error', message: 'Pinned account rejected refreshed credentials; re-login is required.' }
+            : { type: 'rate_limit_error', message: 'Pinned account is unavailable (rate-limited, errored, or already tried). Retry shortly.' },
         }));
       }
       return;
@@ -921,7 +1181,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // declaring the whole fleet exhausted. Without this reset, long-held
     // requests keep sending every recovered account in exclude_account_ids and
     // sleep forever in 60-second increments despite live capacity.
-    if (ctx.tried.size > 0 && !ctx.reconsideredTried) {
+    if (ctx.tried.size > 0 && !ctx.reconsideredTried && !ctx.authRejected) {
       ctx.reconsideredTried = true;
       ctx.tried.clear();
       return forwardRequest(
@@ -930,10 +1190,25 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       );
     }
 
+    if (ctx.authRejected) {
+      ctx.status = 401;
+      if (!res.headersSent) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'authentication_error', message: 'No authenticated account is available; re-login is required.' },
+        }));
+      }
+      return;
+    }
+
     ctx.status = 429;
     ctx.account = '(none available)';
     const status = accountManager.getStatus();
-    const retryAfter = computeRetryAfter(status.accounts);
+    const retryAfter = computeRetryAfter(status.accounts, {
+      switchThreshold: accountManager.switchThreshold,
+      weeklyBucket: accountManager.weeklyBucketForModel?.(ctx.model),
+    });
 
     // Long-hold mode: hold the HTTP connection and poll until an account
     // recovers or the budget (holdSeconds) runs out. Claude Code waits for
@@ -982,10 +1257,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         since: existing ? existing.since : Date.now(),
         retryAfterSeconds: retryAfter,
         everExcluded: Boolean(ctx.everExcluded),
+        response: res,
       });
       console.log(`[TeamClaude] All accounts exhausted — holding connection, retry in ${Math.ceil(waitMs / 1000)}s (${Math.ceil(ctx.holdBudgetMs / 1000)}s budget left)`);
-      await new Promise(resolve => setTimeout(resolve, waitMs));
-      if (res.destroyed) return;
+      if (!await waitForResponseOrTimeout(res, waitMs)) return;
       // Start a new selection epoch after the hold. Durable quota/auth state is
       // represented by AccountManager, not by this request-local Set.
       ctx.reconsideredTried = false;
@@ -1021,6 +1296,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // in the running-sessions readout. Passive when distribution is off.
   accountManager.recordSession(ctx.sessionId, account.index);
   hooks.onRequestRouted?.(reqId, { account: account.name });
+  hooks.onRequestStateRouted?.(reqId, { account: account.name });
 
   // Refresh OAuth token if needed
   await accountManager.ensureTokenFresh(account.index);
@@ -1227,8 +1503,32 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       ctx.reauthed.add(account.index);
       await upstreamRes.body?.cancel();
       console.log(`[TeamClaude] 401 on "${account.name}" — token rejected; forcing refresh and retrying`);
+      const rejectedCredential = account.credential;
       await accountManager.ensureTokenFresh(account.index, true);
+      if (account.credential !== rejectedCredential) {
+        ctx.refreshedAfter401 ??= new Set();
+        ctx.refreshedAfter401.add(account.index);
+      }
       if (res.destroyed) return;
+      return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+    }
+
+    if (upstreamRes.status === 401 && account.type === 'oauth'
+        && ctx.reauthed.has(account.index) && retryCount < maxRetries
+        && !res.headersSent) {
+      // A second rejection after a successful refresh is evidence that this
+      // account cannot serve this request. The first 401 may have raced a token
+      // rotation, so only quarantine when the newly minted token was the one
+      // actually sent. If refresh failed transiently, exclude this account for
+      // this request without changing its durable in-memory auth state.
+      await upstreamRes.body?.cancel();
+      if (ctx.refreshedAfter401?.has(account.index)
+          && headers.authorization === `Bearer ${account.credential}`) {
+        account.status = 'error';
+        console.error(`[TeamClaude] Account "${account.name}" rejected a refreshed token — re-login required; routing this request to another eligible account`);
+      }
+      ctx.tried.add(account.index);
+      ctx.authRejected = true;
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
 
@@ -1250,9 +1550,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       responseHeaders[key] = value;
     }
 
-    res.writeHead(upstreamRes.status, responseHeaders);
-
     if (!upstreamRes.body) {
+      res.writeHead(upstreamRes.status, responseHeaders);
       const l = getLog();
       if (l) { l.write('\n\n=== RESPONSE BODY ===\n(empty)'); l.end(); }
       res.end();
@@ -1260,18 +1559,100 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     }
 
     const contentType = upstreamRes.headers.get('content-type') || '';
-    const isStreaming = contentType.includes('text/event-stream');
+    const isStreaming = /text\/event-stream/i.test(contentType);
+    let responseBody = upstreamRes.body;
+
+    const retryEmptyTurn = async (probe, cancelStream = null) => {
+      if (!probe.empty) return false;
+      const completedRetries = ctx.emptyTurnRetries || 0;
+      const retryLimit = emptyTurnRetryLimit();
+      const willRetry = completedRetries < retryLimit && !res.destroyed;
+      hooks.onEmptyTurn?.(reqId, {
+        account: account.name,
+        sessionId: ctx.sessionId,
+        model: ctx.model,
+        attempt: completedRetries + 1,
+        retryLimit,
+        willRetry,
+        probeBytes: Number(probe.probeBytes) || 0,
+        inputTokens: Number(probe.usage?.inputTokens) || 0,
+        outputTokens: Number(probe.usage?.outputTokens) || 0,
+        responseMode: isStreaming ? 'sse' : 'json',
+      });
+      getLog()?.write(
+        `\n\n=== EMPTY ASSISTANT TURN ===\nthinking-only end_turn after tool_result; `
+        + (willRetry
+          ? `retrying (${completedRetries + 1}/${retryLimit})`
+          : `retry limit reached (${completedRetries}/${retryLimit}); relaying to client`),
+      );
+
+      if (!willRetry) return false;
+      const inputTokens = Number(probe.usage?.inputTokens) || 0;
+      const outputTokens = Number(probe.usage?.outputTokens) || 0;
+      accountManager.updateUsage(account.index, inputTokens, outputTokens);
+      ctx.emptyTurnRetries = completedRetries + 1;
+      console.warn(
+        `[TeamClaude] Empty assistant turn after tool_result `
+        + `(session ${ctx.sessionId || '(anonymous)'}, account "${account.name}", `
+        + `${isStreaming ? 'SSE' : 'JSON'}) — retrying before any response bytes `
+        + `reach Claude Desktop (${ctx.emptyTurnRetries}/${retryLimit})`,
+      );
+      if (cancelStream) await cancelStream.cancel('bounded empty-turn retry');
+      getLog()?.end();
+      await forwardRequest(
+        req, res, body, accountManager, upstream, retryCount,
+        hooks, reqId, ctx, logDir, sx, route,
+      );
+      return true;
+    };
+
+    if (isStreaming && ctx.guardEmptyAfterTool
+        && upstreamRes.status >= 200 && upstreamRes.status < 300) {
+      const probe = await probeAssistantSSE(responseBody);
+      responseBody = probe.stream;
+      if (await retryEmptyTurn(probe, responseBody)) return;
+    }
+
+    let bufferedBody = null;
+    if (!isStreaming) {
+      bufferedBody = Buffer.from(await upstreamRes.arrayBuffer());
+      if (ctx.guardEmptyAfterTool
+          && upstreamRes.status >= 200 && upstreamRes.status < 300
+          && await retryEmptyTurn(probeAssistantJSON(bufferedBody))) return;
+    }
+
+    res.writeHead(upstreamRes.status, responseHeaders);
 
     if (isStreaming) {
       // Stream each chunk straight to the log as it is relayed — never hold the
       // whole (potentially ~1M-token) SSE body in memory.
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
-      await streamResponse(upstreamRes.body, res, account.index, accountManager, bw);
+      await streamResponse(
+        responseBody,
+        res,
+        account.index,
+        accountManager,
+        bw,
+        usage => hooks.onRequestUsage?.(reqId, {
+          ...usage,
+          account: account.name,
+          model: ctx.model,
+        }),
+      );
       l?.end();
     } else {
-      const buf = Buffer.from(await upstreamRes.arrayBuffer());
-      extractUsageFromBody(buf, account.index, accountManager);
+      const buf = bufferedBody;
+      extractUsageFromBody(
+        buf,
+        account.index,
+        accountManager,
+        usage => hooks.onRequestUsage?.(reqId, {
+          ...usage,
+          account: account.name,
+          model: ctx.model,
+        }),
+      );
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
       res.end(buf);
@@ -1317,6 +1698,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     const neverOpened = err instanceof Error && (
       /proxy refused CONNECT/i.test(String(err.message || ''))
       || /proxy CONNECT timed out/i.test(String(err.message || ''))
+      || (err.code === 'ENOBUFS'
+          && /127\.0\.0\.1|localhost/.test(String(err.message || '')))
       || ((err.code === 'ECONNREFUSED' || err.code === 'ETIMEDOUT')
           && /127\.0\.0\.1|localhost/.test(String(err.message || '')))
     );
@@ -1341,6 +1724,15 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // path, not the account — and the fast failure lets Node evict a dead
     // socket so the retry reconnects cleanly.
     if (errorClass === 'transport') {
+      ctx.interrupted = true;
+      hooks.onRequestInterrupted?.(reqId, {
+        account: account.name,
+        sessionId: ctx.sessionId,
+        model: ctx.model,
+        phase: res.headersSent ? 'response-stream' : 'before-response',
+        code: err?.code || null,
+        message: String(err?.message || err),
+      });
       res.destroy();
       return;
     }
@@ -1374,6 +1766,15 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // classified transient: we can't send a status or fail over, and
       // streamResponse deliberately skipped res.end(). Destroy so the client
       // sees a broken response and retries instead of hanging on an open socket.
+      ctx.interrupted = true;
+      hooks.onRequestInterrupted?.(reqId, {
+        account: account.name,
+        sessionId: ctx.sessionId,
+        model: ctx.model,
+        phase: 'response-stream',
+        code: err?.code || null,
+        message: String(err?.message || err),
+      });
       res.destroy();
     }
   }
@@ -1424,7 +1825,14 @@ export function readWithIdleTimeout(reader, ms, phase = 'stream') {
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
-async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter) {
+async function streamResponse(
+  webStream,
+  res,
+  accountIndex,
+  accountManager,
+  bodyWriter,
+  onUsage = null,
+) {
   const reader = webStream.getReader();
   const idleMs = resolveBodyIdleTimeout();
   const firstBodyMs = resolveFirstBodyTimeout();
@@ -1460,7 +1868,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
       sseBuffer = events.pop(); // keep incomplete event
 
       for (const event of events) {
-        parseSSEUsage(event, accountIndex, accountManager);
+        parseSSEUsage(event, accountIndex, accountManager, onUsage);
       }
 
       // Handle backpressure — also bail out if client disconnects,
@@ -1480,7 +1888,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
 
     // Parse any remaining buffer
     if (sseBuffer.trim()) {
-      parseSSEUsage(sseBuffer, accountIndex, accountManager);
+      parseSSEUsage(sseBuffer, accountIndex, accountManager, onUsage);
     }
   } catch (err) {
     // A mid-stream idle timeout (or any read error) means the upstream went
@@ -1498,31 +1906,48 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
   }
 }
 
-function parseSSEUsage(event, accountIndex, accountManager) {
+function parseSSEUsage(event, accountIndex, accountManager, onUsage = null) {
   const dataLine = event.split('\n').find(l => l.startsWith('data: '));
   if (!dataLine) return;
 
   try {
     const data = JSON.parse(dataLine.slice(6));
     if (data.type === 'message_start' && data.message?.usage) {
-      accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
+      const inputTokens = finiteUsage(data.message.usage.input_tokens);
+      accountManager.updateUsage(accountIndex, inputTokens, 0);
+      onUsage?.({ inputTokens, outputTokens: 0 });
     } else if (data.type === 'message_delta' && data.usage) {
-      accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
+      const outputTokens = finiteUsage(data.usage.output_tokens);
+      accountManager.updateUsage(accountIndex, 0, outputTokens);
+      onUsage?.({ inputTokens: 0, outputTokens });
     }
   } catch {
     // not valid JSON, skip
   }
 }
 
-function extractUsageFromBody(buffer, accountIndex, accountManager) {
+function extractUsageFromBody(
+  buffer,
+  accountIndex,
+  accountManager,
+  onUsage = null,
+) {
   try {
     const json = JSON.parse(buffer.toString());
     if (json.usage) {
-      accountManager.updateUsage(accountIndex, json.usage.input_tokens, json.usage.output_tokens);
+      const inputTokens = finiteUsage(json.usage.input_tokens);
+      const outputTokens = finiteUsage(json.usage.output_tokens);
+      accountManager.updateUsage(accountIndex, inputTokens, outputTokens);
+      onUsage?.({ inputTokens, outputTokens });
     }
   } catch {
     // not JSON or no usage
   }
+}
+
+function finiteUsage(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : 0;
 }
 
 // Rewrite the `model` field in a JSON request body using a per-account map.
@@ -1549,9 +1974,15 @@ export function rewriteModel(body, modelMap) {
 // reset, often more than a day out. That single wrong number is most of the
 // difference between a fleet that looks broken and one that is visibly parked.
 //
-// All windowed buckets are considered, since recovering ANY of them can make an
-// account selectable again.
-export function computeRetryAfter(accounts) {
+// Only a bucket that is currently at the switch threshold can recover an
+// account.  Counting every future reset made a healthy 48%-used 5h window look
+// like the next recovery while the account's 99%-used weekly window remained
+// exhausted.  Model-scoped callers also provide the governing weekly bucket so
+// an unrelated Fable/Sonnet reset cannot promise capacity to an Opus request.
+export function computeRetryAfter(
+  accounts,
+  { switchThreshold = 0.98, weeklyBucket = null } = {},
+) {
   const now = Date.now();
   let soonest = Infinity;
   const consider = (value) => {
@@ -1561,14 +1992,31 @@ export function computeRetryAfter(accounts) {
   };
 
   for (const acct of accounts) {
-    if (acct?.disabled) continue;
+    if (acct?.disabled || acct?.status === 'error') continue;
     consider(acct?.rateLimitedUntil);
     const q = acct?.quota || {};
-    consider(q.resetsAt);
-    consider(q.unified5hReset);
-    consider(q.unified7dReset);
-    consider(q.unified7dSonnetReset);
-    consider(q.unified7dFableReset);
+    if (q.unified5h != null && q.unified5h >= switchThreshold) {
+      consider(q.unified5hReset);
+    }
+
+    const weeklyKeys = weeklyBucket
+      ? [weeklyBucket]
+      : ['unified7d', 'unified7dSonnet', 'unified7dFable'];
+    for (const requestedKey of weeklyKeys) {
+      const key = q[requestedKey] != null ? requestedKey : 'unified7d';
+      if (q[key] != null && q[key] >= switchThreshold) {
+        consider(q[`${key}Reset`]);
+      }
+    }
+
+    const tokenUsed = q.tokensLimit > 0 && q.tokensRemaining != null
+      ? 1 - (q.tokensRemaining / q.tokensLimit) : null;
+    const requestUsed = q.requestsLimit > 0 && q.requestsRemaining != null
+      ? 1 - (q.requestsRemaining / q.requestsLimit) : null;
+    if ((tokenUsed != null && tokenUsed >= switchThreshold)
+        || (requestUsed != null && requestUsed >= switchThreshold)) {
+      consider(q.resetsAt);
+    }
   }
   return soonest === Infinity ? 60 : Math.max(1, Math.ceil(soonest / 1000));
 }

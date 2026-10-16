@@ -442,19 +442,27 @@ function startCallbackServer(expectedState) {
     });
     server.on('error', reject);
 
-    // Timeout after 2 minutes (unref so it doesn't keep the process alive)
+    // Keep the browser login window configurable for slower Windows browsers.
+    // The default remains two minutes for unattended CLI use; the desktop
+    // installer can opt into a longer window without changing OAuth semantics.
+    const timeoutMs = Number(process.env.TEAMCLAUDE_LOGIN_TIMEOUT_MS) || 120_000;
+    const timeoutMinutes = Math.max(1, Math.round(timeoutMs / 60_000));
     const timer = setTimeout(() => {
-      rejectCode(new Error('Login timed out after 2 minutes'));
+      rejectCode(new Error(`Login timed out after ${timeoutMinutes} minute${timeoutMinutes === 1 ? '' : 's'}`));
       server.close();
-    }, 120_000);
+    }, timeoutMs);
     timer.unref();
   });
 }
 
 function openBrowser(url) {
   const platform = process.platform;
-  const cmd = platform === 'darwin' ? 'open'
-    : platform === 'win32' ? 'start'
-    : 'xdg-open';
+  if (platform === 'win32') {
+    // `start` treats its first quoted argument as a window title. Supplying
+    // an empty title is required when the URL itself is quoted.
+    exec(`start "" ${JSON.stringify(url)}`, () => {});
+    return;
+  }
+  const cmd = platform === 'darwin' ? 'open' : 'xdg-open';
   exec(`${cmd} ${JSON.stringify(url)}`, () => {});
 }

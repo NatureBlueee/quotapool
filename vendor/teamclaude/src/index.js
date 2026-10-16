@@ -5,6 +5,7 @@ import { createInterface } from 'node:readline';
 import { createWriteStream } from 'node:fs';
 import net from 'node:net';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState, applyFleetPolicy } from './config.js';
+import { applyReloadableRuntimeSettings } from './runtime-settings.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
 import { importCredentials, importSetupToken, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
@@ -21,6 +22,7 @@ import { renderStatus } from './status-renderer.js';
 import { buildClaudeEnvLines, encodePinComponent } from './claude-env.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 import { FleetCoordinator } from './fleet-coordinator.js';
+import { UsageAnalytics } from './usage-analytics.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -185,15 +187,44 @@ async function serverCommand() {
   });
   if (savedState?.quota) accountManager.restoreQuotaState(savedState.quota);
 
+  // Requests and token totals must outlive the proxy process.  The old
+  // AccountManager counters were useful for a quick status line but reset to
+  // zero whenever Desktop or Windows restarted, so they could not support
+  // daily trends or quota-efficiency analysis.
+  const usageAnalytics = new UsageAnalytics(savedState?.analytics);
+  usageAnalytics.observeQuotas(accountManager.accounts);
+
   // With quota restored, pick the best account up front (highest priority /
   // soonest-resetting weekly window) instead of defaulting to the first one.
   accountManager.selectActiveAccount();
 
-  // Periodically persist quota (and once more on shutdown) to the state file.
-  const persistQuotaState = () =>
-    saveState({ quota: accountManager.exportQuotaState() })
-      .catch(err => console.error(`[TeamClaude] Failed to save quota state: ${err.message}`));
-  let quotaSaveInterval = null;
+  // Persist quota and analytics as one atomic runtime snapshot.  Serialize
+  // saves: request completions can arrive together and two atomic renames in
+  // parallel would otherwise let the older snapshot win.
+  const stateBase = savedState && typeof savedState === 'object'
+    ? { ...savedState } : {};
+  let stateSaveChain = Promise.resolve();
+  let stateSaveTimer = null;
+  const persistRuntimeState = () => {
+    const state = {
+      ...stateBase,
+      quota: accountManager.exportQuotaState(),
+      analytics: usageAnalytics.exportState(),
+    };
+    stateSaveChain = stateSaveChain.catch(() => {}).then(() => saveState(state));
+    return stateSaveChain.catch(err => {
+      console.error(`[TeamClaude] Failed to save runtime state: ${err.message}`);
+    });
+  };
+  const scheduleRuntimeStateSave = () => {
+    if (stateSaveTimer) return;
+    stateSaveTimer = setTimeout(() => {
+      stateSaveTimer = null;
+      persistRuntimeState();
+    }, 1500);
+    stateSaveTimer.unref?.();
+  };
+  let stateSaveInterval = null;
 
   // Persist refreshed tokens back to config (re-read from disk to avoid clobbering
   // accounts added externally, e.g. by `teamclaude import` while server is running)
@@ -277,6 +308,16 @@ async function serverCommand() {
     }
 
     const added = await syncAccountsFromDisk(diskConfig, config, accountManager);
+    const runtimeChanges = applyReloadableRuntimeSettings(
+      diskConfig, config, accountManager,
+    );
+    if (runtimeChanges.switchThreshold != null) {
+      console.log(
+        `[TeamClaude] Applied switch threshold ${(
+          runtimeChanges.switchThreshold * 100
+        ).toFixed(1)}% without restarting`,
+      );
+    }
     // Pick up route table edits (teamclaude route …, TUI editor, or a hand edit).
     config.routes = diskConfig.routes || [];
     accountManager.setRoutes(config.routes);
@@ -412,6 +453,114 @@ async function serverCommand() {
     process.on('exit', () => aStream.end());
   }
 
+  // Request health is independent from the optional activity log.  Previously
+  // `eventLogging: "hide"` removed the only in-flight bookkeeping, so a half
+  // response looked like a successful 200 and the dashboard could not tell an
+  // active stream from an idle process.  Keep a bounded, token-free lifecycle
+  // view for the local status endpoint regardless of presentation settings.
+  const requestHealth = {
+    active: new Map(),
+    interruptedTotal: 0,
+    recentInterruptions: [],
+    emptyTurnDetectionsTotal: 0,
+    emptyTurnRetriesTotal: 0,
+    recentEmptyTurns: [],
+  };
+  hooks.onRequestStateStart = (id, info) => {
+    requestHealth.active.set(id, {
+      ...info,
+      startedAt: Date.now(),
+      inputTokens: 0,
+      outputTokens: 0,
+      interrupted: false,
+    });
+  };
+  hooks.onRequestStateRouted = (id, info) => {
+    const current = requestHealth.active.get(id);
+    if (current) Object.assign(current, info);
+  };
+  hooks.onRequestInterrupted = (id, info) => {
+    requestHealth.interruptedTotal += 1;
+    const item = {
+      at: new Date().toISOString(),
+      requestId: id,
+      sessionId: info.sessionId ? String(info.sessionId).slice(0, 12) : null,
+      account: info.account || null,
+      model: info.model || null,
+      phase: info.phase || 'unknown',
+      code: info.code || null,
+      message: info.message || 'upstream interrupted',
+    };
+    requestHealth.recentInterruptions.push(item);
+    if (requestHealth.recentInterruptions.length > 20) {
+      requestHealth.recentInterruptions.shift();
+    }
+    const current = requestHealth.active.get(id);
+    if (current) current.interrupted = true;
+  };
+  hooks.onRequestUsage = (id, info) => {
+    const current = requestHealth.active.get(id);
+    if (!current) return;
+    if (info.account) current.account = info.account;
+    if (info.model) current.model = info.model;
+    // Anthropic's stream usage events carry the current total.  Keep the
+    // maximum rather than adding so a repeated/final event cannot double count.
+    current.inputTokens = Math.max(
+      Number(current.inputTokens) || 0,
+      Number(info.inputTokens) || 0,
+    );
+    current.outputTokens = Math.max(
+      Number(current.outputTokens) || 0,
+      Number(info.outputTokens) || 0,
+    );
+  };
+  hooks.onEmptyTurn = (id, info) => {
+    requestHealth.emptyTurnDetectionsTotal += 1;
+    if (info.willRetry) requestHealth.emptyTurnRetriesTotal += 1;
+    const item = {
+      at: new Date().toISOString(),
+      requestId: id,
+      sessionId: info.sessionId ? String(info.sessionId).slice(0, 12) : null,
+      account: info.account || null,
+      model: info.model || null,
+      attempt: Number(info.attempt) || 0,
+      retryLimit: Number(info.retryLimit) || 0,
+      willRetry: Boolean(info.willRetry),
+      probeBytes: Number(info.probeBytes) || 0,
+    };
+    requestHealth.recentEmptyTurns.push(item);
+    if (requestHealth.recentEmptyTurns.length > 20) {
+      requestHealth.recentEmptyTurns.shift();
+    }
+    const current = requestHealth.active.get(id);
+    if (current) {
+      current.emptyTurnDetections = (current.emptyTurnDetections || 0) + 1;
+      if (info.willRetry) {
+        current.emptyTurnRetries = (current.emptyTurnRetries || 0) + 1;
+        current.emptyTurnRetryInputTokens =
+          (current.emptyTurnRetryInputTokens || 0) + (Number(info.inputTokens) || 0);
+        current.emptyTurnRetryOutputTokens =
+          (current.emptyTurnRetryOutputTokens || 0) + (Number(info.outputTokens) || 0);
+      }
+    }
+  };
+  hooks.onRequestStateEnd = (id, info = {}) => {
+    const current = requestHealth.active.get(id);
+    requestHealth.active.delete(id);
+    if (!current || !/\/v1\/messages(?:\?|$)/.test(String(current.path || ''))) return;
+    usageAnalytics.recordRequest({
+      at: current.startedAt,
+      account: info.account || current.account,
+      model: info.model || current.model,
+      inputTokens: current.inputTokens + (current.emptyTurnRetryInputTokens || 0),
+      outputTokens: current.outputTokens + (current.emptyTurnRetryOutputTokens || 0),
+      status: info.status || current.status,
+      interrupted: Boolean(info.interrupted || current.interrupted),
+    });
+    usageAnalytics.observeQuotas(accountManager.accounts);
+    scheduleRuntimeStateSave();
+  };
+
   if (fleetEnabled) {
     const fleetCoordinator = new FleetCoordinator(config.fleetCoordinator);
     hooks.selectAccount = info => fleetCoordinator.select(info);
@@ -431,13 +580,28 @@ async function serverCommand() {
     }
     return prober.probeIfDue(30_000);
   };
-  hooks.getStatusExtra = () => ({
+  hooks.getStatusExtra = () => {
+    if (usageAnalytics.observeQuotas(accountManager.accounts)) {
+      scheduleRuntimeStateSave();
+    }
+    return ({
     server: {
       startedAt: new Date(serverStartedAt).toISOString(),
       uptimeSeconds: Math.round((Date.now() - serverStartedAt) / 1000),
       port,
       upstream: config.upstream || 'https://api.anthropic.com',
     },
+    requestHealth: {
+      active: requestHealth.active.size,
+      interruptedTotal: requestHealth.interruptedTotal,
+      lastInterruptedAt: requestHealth.recentInterruptions.at(-1)?.at || null,
+      recentInterruptions: requestHealth.recentInterruptions.slice(-10),
+      emptyTurnDetectionsTotal: requestHealth.emptyTurnDetectionsTotal,
+      emptyTurnRetriesTotal: requestHealth.emptyTurnRetriesTotal,
+      lastEmptyTurnAt: requestHealth.recentEmptyTurns.at(-1)?.at || null,
+      recentEmptyTurns: requestHealth.recentEmptyTurns.slice(-10),
+    },
+    analytics: usageAnalytics.snapshot(),
     probe: prober?.getStatus() || {
       enabled: false,
       intervalSeconds: config.quotaProbeSeconds || 0,
@@ -464,7 +628,8 @@ async function serverCommand() {
         error: null,
       })),
     },
-  });
+    });
+  };
 
   // Fleet launchers are fail-closed and require NODE_EXTRA_CA_CERTS before they
   // contact the proxy. Generate the local CA at service startup so the first
@@ -515,9 +680,15 @@ async function serverCommand() {
   // server is glanceable. Works in both TUI and headless modes.
   const stopTitle = startTerminalTitleUpdater(accountManager);
 
-  // Persist quota every minute; unref so it never keeps the process alive.
-  quotaSaveInterval = setInterval(persistQuotaState, 60_000);
-  quotaSaveInterval.unref?.();
+  // Persist quota and analytics every minute; unref so it never keeps the
+  // process alive. Request completions also schedule a short debounced save.
+  stateSaveInterval = setInterval(() => {
+    // Sample quota progress even when the dashboard is closed. This daily
+    // delta is the baseline for "tomorrow needs N× yesterday's workload".
+    usageAnalytics.observeQuotas(accountManager.accounts);
+    persistRuntimeState();
+  }, 60_000);
+  stateSaveInterval.unref?.();
 
   // Start the opt-in quota probe (no-op when quotaProbeSeconds is 0).
   prober = new Prober(accountManager, { intervalMs: (config.quotaProbeSeconds || 0) * 1000 });
@@ -553,8 +724,9 @@ async function serverCommand() {
     if (!tui) console.log('\n[TeamClaude] Shutting down...');
     prober?.stop();
     warmer?.stop();
-    if (quotaSaveInterval) clearInterval(quotaSaveInterval);
-    await persistQuotaState();
+    if (stateSaveInterval) clearInterval(stateSaveInterval);
+    if (stateSaveTimer) clearTimeout(stateSaveTimer);
+    await persistRuntimeState();
     // Don't linger waiting on keep-alive / streaming connections: actively
     // destroy them so server.close() can complete promptly, and hard-exit after a
     // short grace period in case anything still hangs.

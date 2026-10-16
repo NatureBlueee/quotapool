@@ -140,6 +140,41 @@ test('a retry that succeeds is used', async () => {
   assert.equal(account?.name, 'real', 'the restart finished; the request lives');
 });
 
+test('a recent approved route survives one coordinator timeout', async () => {
+  let available = true;
+  const manager = {
+    ...accountManager,
+    isAccountAvailable: () => available,
+  };
+  const coordinator = new FleetCoordinator({
+    baseUrl: 'http://127.0.0.1:1',
+    routeFallbackMs: 90_000,
+  });
+  coordinator._post = async () => ({
+    response: { ok: true, status: 200 },
+    result: { account_id: 'uuid-real' },
+  });
+
+  const first = await coordinator._selectOrWait(
+    { accountManager: manager, ctx: context(), req: request });
+  assert.equal(first?.name, 'real');
+
+  coordinator._post = async () => {
+    const err = new Error('Fleet coordinator unavailable: timeout');
+    err.fleetCoordinatorUnreachable = true;
+    throw err;
+  };
+  const fallback = await coordinator._selectOrWait(
+    { accountManager: manager, ctx: context(), req: request });
+  assert.equal(fallback?.name, 'real');
+
+  // Live quota/auth state still wins over the cache.  This directly protects
+  // against serving an account that became unavailable after approval.
+  available = false;
+  assert.equal(coordinator._recentApprovedRoute(
+    { accountManager: manager, ctx: context(), req: request }), null);
+});
+
 test('an unrelated error is not swallowed', async () => {
   // Only the unreachable case waits. Anything else must keep propagating, or
   // this becomes a catch-all that hides real faults — the exact shape of the

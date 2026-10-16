@@ -32,6 +32,14 @@ test('a local proxy that is not listening is also transport', () => {
   assert.equal(classifyUpstreamError(err), 'transport');
 });
 
+test('local proxy socket exhaustion is transport, not an account fault', () => {
+  const err = new Error('connect ENOBUFS 127.0.0.1:7897 - Local');
+  err.code = 'ENOBUFS';
+  assert.equal(classifyUpstreamError(err), 'transport');
+  assert.ok(/127\.0\.0\.1|localhost/.test(err.message),
+    'loopback ENOBUFS happened before the CONNECT tunnel opened and is safe to retry');
+});
+
 test('a mid-stream hang up is transport too, and must not be retried', () => {
   // It classifies the same way; what separates them is the `neverOpened` test
   // in the handler, which this asserts stays distinguishable from the outside.
